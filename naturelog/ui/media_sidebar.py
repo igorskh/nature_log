@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QMessageBox,
     QProgressBar,
     QPushButton,
     QStyle,
@@ -48,7 +49,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from naturelog.gps import Track, position_at
+from naturelog.gps import Track, TrackPosition, position_at
 from naturelog.media import (
     MediaFile,
     MediaKind,
@@ -57,8 +58,12 @@ from naturelog.media import (
     make_thumbnails,
     read_media_files,
 )
+from naturelog.media.edit_datetime import DatetimeEdit, EditResult, edit_datetimes
+from naturelog.media.exiftool import exiftool_path
+from naturelog.media.geotag import GeotagResult, can_geotag, write_coordinates
 from naturelog.species import SpeciesPrediction, can_detect, detected, top_detection
 from naturelog.timezones import format_datetime
+from naturelog.ui.edit_datetime_dialog import EditDatetimeDialog
 from naturelog.ui.map_view import local_files
 
 _ICON_SIZE = 72
@@ -79,6 +84,8 @@ class _Signals(QObject):
     thumbnail = Signal(str, object)  # path, QImage
     failed = Signal(str)
     progress = Signal(int, int)  # done, total (total 0 = unknown)
+    written = Signal(object)  # list[GeotagResult]
+    edited = Signal(object, object)  # list[EditResult], list[MediaFile] (re-read)
     finished = Signal()
 
 
@@ -121,6 +128,54 @@ class _ThumbnailTask(QRunnable):
                     image = QImage.fromData(data)  # QImage is safe off the UI thread
                     if not image.isNull():
                         self.signals.thumbnail.emit(str(media.path), image)
+        finally:
+            self.signals.finished.emit()
+
+
+class _GeotagTask(QRunnable):
+    """Writes GPS coordinates into the EXIF of files off the UI thread."""
+
+    def __init__(self, items: list[tuple[MediaFile, TrackPosition]]) -> None:
+        super().__init__()
+        self.items = items
+        self.signals = _Signals()
+        self.cancelled = threading.Event()
+
+    def run(self) -> None:
+        total = len(self.items)
+        try:
+            self.signals.progress.emit(0, total)
+            results = write_coordinates(
+                self.items,
+                lambda done: self.signals.progress.emit(done, total),
+                self.cancelled,
+            )
+            self.signals.written.emit(results)
+        except Exception as exc:
+            self.signals.failed.emit(f"Cannot write coordinates: {exc}")
+        finally:
+            self.signals.finished.emit()
+
+
+class _EditDatetimeTask(QRunnable):
+    """Sets file dates off the UI thread, then re-reads the files' capture times."""
+
+    def __init__(self, paths: list[Path], edit: DatetimeEdit) -> None:
+        super().__init__()
+        self.paths = paths
+        self.edit = edit
+        self.signals = _Signals()
+
+    def run(self) -> None:
+        total = len(self.paths)
+        try:
+            self.signals.progress.emit(0, total)
+            results = edit_datetimes(
+                self.paths, self.edit, lambda done: self.signals.progress.emit(done, total)
+            )
+            self.signals.edited.emit(results, read_media_files(self.paths))
+        except Exception as exc:
+            self.signals.failed.emit(f"Cannot edit date and time: {exc}")
         finally:
             self.signals.finished.emit()
 
@@ -228,6 +283,8 @@ class MediaSidebar(QWidget):
     detectionsChanged = Signal()
     #: User asked to detect species in these :class:`MediaFile` photos/recordings.
     detectRequested = Signal(list)
+    #: User asked to upload these selected :class:`MediaFile` objects to iNaturalist.
+    uploadRequested = Signal(list)
     #: Status messages for the main window's status bar.
     message = Signal(str)
 
@@ -283,8 +340,14 @@ class MediaSidebar(QWidget):
         self._copy_time_action = self._list_action(
             "Copy date and time", QKeySequence(), self.copy_datetimes
         )
+        self._edit_time_action = self._list_action(
+            "Edit date and time…", QKeySequence(), self.edit_datetimes
+        )
         self._detect_action = self._list_action(
             "Detect species", QKeySequence(), self._request_detection
+        )
+        self._write_coords_action = self._list_action(
+            "Write coordinates to files…", QKeySequence(), self.write_coordinates
         )
         self._list.setContextMenuPolicy(Qt.ContextMenuPolicy.ActionsContextMenu)
 
@@ -295,9 +358,28 @@ class MediaSidebar(QWidget):
         self._remove_button.clicked.connect(self.remove_selected)
         buttons.addWidget(self._remove_button)
 
+        self._write_coords_button = QPushButton("Write coordinates")
+        self._write_coords_button.setToolTip(
+            "Write GPS coordinates from the track into the EXIF of the selected photos "
+            "(a backup of each original is kept as <name>_original)"
+        )
+        self._write_coords_button.clicked.connect(self.write_coordinates)
+        self._upload_button = QPushButton("Upload to iNaturalist")
+        self._upload_button.setToolTip(
+            "Open iNaturalist in a separate window to sign in and upload the selected files"
+        )
+        self._upload_button.clicked.connect(
+            lambda: self.uploadRequested.emit(self.selected_files())
+        )
+        geotag_buttons = QHBoxLayout()
+        geotag_buttons.addWidget(self._write_coords_button)
+        geotag_buttons.addWidget(self._upload_button)
+        geotag_buttons.addStretch(1)
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addLayout(buttons)
+        layout.addLayout(geotag_buttons)
         layout.addWidget(self._list, 1)
         layout.addWidget(self._progress_bar)
         layout.addWidget(self._count_label)
@@ -422,6 +504,64 @@ class MediaSidebar(QWidget):
             text += f" ({missing} without GPS position skipped)"
         self.message.emit(text)
 
+    def write_coordinates(self) -> None:
+        """Write track coordinates into the EXIF GPS tags of the selected photos.
+
+        Only EXIF-capable formats with a position on the track are written;
+        files outside the track or in a gap are skipped (no extrapolation).
+        """
+        files = self.selected_files()
+        if not files or self._geotag_running():
+            return
+        if self._track is None:
+            self.message.emit("Load a GPS log to get coordinates")
+            return
+        if exiftool_path() is None:
+            QMessageBox.warning(
+                self, "Write coordinates", "ExifTool is required to write coordinates."
+            )
+            return
+        compatible = [m for m in files if can_geotag(m)]
+        items = []
+        for media in compatible:
+            position = position_at(self._track, media.capture_time(self._tz))
+            if position is not None:
+                items.append((media, position))
+        notes = []
+        if len(files) > len(compatible):
+            notes.append(f"{len(files) - len(compatible)} not a supported photo format")
+        if len(compatible) > len(items):
+            notes.append(f"{len(compatible) - len(items)} outside the track or in a gap")
+        if not items:
+            self.message.emit(
+                "No selected file can be geotagged" + (f" ({', '.join(notes)})" if notes else "")
+            )
+            return
+        text = (
+            f"Write GPS coordinates into {len(items)} "
+            f"file{'s' if len(items) != 1 else ''}?\n\n"
+            "Existing GPS tags are replaced. ExifTool keeps each original as "
+            "<name>_original next to the file."
+        )
+        if notes:
+            text += "\n\nSkipped: " + "; ".join(notes) + "."
+        answer = QMessageBox.question(
+            self,
+            "Write coordinates",
+            text,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        task = _GeotagTask(items)
+        task.signals.written.connect(lambda results: self._on_written(results, len(files)))
+        task.signals.failed.connect(self.message)
+        task.signals.progress.connect(lambda done, total: self._on_progress(task, done, total))
+        task.signals.finished.connect(lambda: self._on_geotag_finished(task))
+        self._start(task)
+        self._update_count()
+
     def copy_datetimes(self) -> None:
         """Copy capture times (selected timezone) of the selected files, one line per file."""
         files = self.selected_files()
@@ -435,6 +575,29 @@ class MediaSidebar(QWidget):
         self.message.emit(
             f"Copied date and time of {len(lines)} file{'s' if len(lines) != 1 else ''}"
         )
+
+    def edit_datetimes(self) -> None:
+        """Ask for a date and set the chosen file dates of the selected files to it."""
+        files = self.selected_files()
+        if not files:
+            self.message.emit("Select files to edit the date and time of")
+            return
+        if self._edit_running():
+            self.message.emit("Dates are already being edited")
+            return
+        dialog = EditDatetimeDialog(files, self._tz, self)
+        if dialog.exec() != EditDatetimeDialog.DialogCode.Accepted:
+            return
+        edit = dialog.edit()
+        if not edit.any:
+            return
+        task = _EditDatetimeTask([m.path for m in files], edit)
+        task.signals.edited.connect(self._on_edited)
+        task.signals.failed.connect(self.message)
+        task.signals.progress.connect(lambda done, total: self._on_progress(task, done, total))
+        task.signals.finished.connect(lambda: self._on_geotag_finished(task))
+        self._start(task)
+        self._update_count()
 
     def set_timezone(self, tz: tzinfo) -> None:
         self._tz = tz
@@ -479,9 +642,9 @@ class MediaSidebar(QWidget):
             self.filesRemoved.emit(removed)
 
     def shutdown(self) -> None:
-        """Stop pending preview generation (call when the window closes)."""
+        """Stop pending previews and coordinate writes (call when the window closes)."""
         for task in self._tasks:
-            if isinstance(task, _ThumbnailTask):
+            if isinstance(task, (_ThumbnailTask, _GeotagTask)):
                 task.cancelled.set()
 
     # --- selection ------------------------------------------------------
@@ -542,6 +705,67 @@ class MediaSidebar(QWidget):
         self._progress.pop(task, None)
         self._update_progress()
 
+    def _edit_running(self) -> bool:
+        return any(isinstance(t, _EditDatetimeTask) for t in self._tasks)
+
+    def _on_edited(self, results: list[EditResult], files: list[MediaFile]) -> None:
+        # Show the new capture times; the list may have changed meanwhile.
+        updated = []
+        for media in files:
+            item = self._items.get(media.path)
+            if item is not None:
+                item.setData(_ROLE_MEDIA, media)
+                self._apply_text(item, media)
+                updated.append(media)
+        self._sort()
+        if updated:
+            self.filesAdded.emit(updated)  # listeners refresh timeline and session
+            self._on_selection_changed()
+
+        failed = [r for r in results if r.error is not None]
+        done = len(results) - len(failed)
+        text = f"Edited date and time of {done} file{'s' if done != 1 else ''}"
+        if failed:
+            text += f", {len(failed)} failed"
+        self.message.emit(text)
+        if failed:
+            lines = [f"{r.path.name}: {r.error}" for r in failed[:15]]
+            if len(failed) > 15:
+                lines.append(f"… and {len(failed) - 15} more")
+            QMessageBox.warning(
+                self,
+                "Edit date and time",
+                f"{len(failed)} file{'s' if len(failed) != 1 else ''} not fully updated:\n\n"
+                + "\n".join(lines),
+            )
+
+    def _geotag_running(self) -> bool:
+        return any(isinstance(t, _GeotagTask) for t in self._tasks)
+
+    def _on_geotag_finished(self, task: QRunnable) -> None:
+        self._finish(task)
+        self._update_count()
+
+    def _on_written(self, results: list[GeotagResult], selected: int) -> None:
+        failed = [r for r in results if r.error is not None]
+        written = len(results) - len(failed)
+        text = f"Wrote coordinates to {written} file{'s' if written != 1 else ''}"
+        if failed:
+            text += f", {len(failed)} failed"
+        if selected > len(results):
+            text += f" ({selected - len(results)} skipped)"
+        self.message.emit(text)
+        if failed:
+            lines = [f"{r.path.name}: {r.error}" for r in failed[:15]]
+            if len(failed) > 15:
+                lines.append(f"… and {len(failed) - 15} more")
+            QMessageBox.warning(
+                self,
+                "Write coordinates",
+                f"{len(failed)} file{'s' if len(failed) != 1 else ''} not updated:\n\n"
+                + "\n".join(lines),
+            )
+
     def _on_progress(self, task: QRunnable, done: int, total: int) -> None:
         if task in self._tasks and self._current(task):  # ignore late or stale signals
             self._progress[task] = (done, total)
@@ -551,7 +775,16 @@ class MediaSidebar(QWidget):
         """Show combined progress: metadata reading first, then previews."""
         scans = [p for t, p in self._progress.items() if isinstance(t, _ScanTask)]
         previews = [p for t, p in self._progress.items() if isinstance(t, _ThumbnailTask)]
-        entries, label = (scans, "Reading metadata") if scans else (previews, "Generating previews")
+        writes = [p for t, p in self._progress.items() if isinstance(t, _GeotagTask)]
+        edits = [p for t, p in self._progress.items() if isinstance(t, _EditDatetimeTask)]
+        if writes:
+            entries, label = writes, "Writing coordinates"
+        elif edits:
+            entries, label = edits, "Editing dates"
+        elif scans:
+            entries, label = scans, "Reading metadata"
+        else:
+            entries, label = previews, "Generating previews"
         if not entries:
             self._progress_bar.hide()
             return
@@ -660,6 +893,10 @@ class MediaSidebar(QWidget):
         self._clear_selection_action.setEnabled(selected > 0)
         self._copy_coords_action.setEnabled(selected > 0 and self._track is not None)
         self._copy_time_action.setEnabled(selected > 0)
+        self._edit_time_action.setEnabled(selected > 0 and not self._edit_running())
         self._detect_action.setEnabled(selected > 0)
+        can_write = selected > 0 and self._track is not None and not self._geotag_running()
+        self._write_coords_action.setEnabled(can_write)
+        self._write_coords_button.setEnabled(can_write)
         self._select_all_action.setEnabled(count > 0)
         self._list.viewport().update()

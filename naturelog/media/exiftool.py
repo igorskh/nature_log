@@ -1,4 +1,8 @@
-"""Thin read-only wrapper around the ExifTool command-line program."""
+"""Thin wrapper around the ExifTool command-line program.
+
+Reads metadata and writes GPS tags. Writes keep ExifTool's default backup
+(``<name>_original``) so the original file is preserved.
+"""
 
 from __future__ import annotations
 
@@ -26,20 +30,23 @@ def exiftool_path() -> str | None:
     return shutil.which("exiftool")
 
 
-def _run(args: Sequence[str], timeout: float) -> bytes:
+def _exec(args: Sequence[str], timeout: float) -> subprocess.CompletedProcess[bytes]:
     exe = exiftool_path()
     if exe is None:
         raise FileNotFoundError("exiftool is not installed")
     # Arguments go through stdin (-@ -) so long file lists and non-ASCII paths are safe.
     argfile = "\n".join(["-charset", "filename=utf8", *args]).encode("utf-8")
-    result = subprocess.run(
+    return subprocess.run(
         [exe, "-@", "-"],
         input=argfile,
         capture_output=True,
         timeout=timeout,
         creationflags=_CREATIONFLAGS,
     )
-    return result.stdout
+
+
+def _run(args: Sequence[str], timeout: float) -> bytes:
+    return _exec(args, timeout).stdout
 
 
 def _read_batch(batch: Sequence[Path], tags: Sequence[str]) -> dict[Path, dict[str, Any]]:
@@ -88,3 +95,26 @@ def read_tags(
 def read_binary_tag(path: Path, tag: str) -> bytes:
     """The raw bytes of a binary tag (e.g. an embedded preview), or empty bytes."""
     return _run(["-b", f"-{tag}", str(path)], timeout=30)
+
+
+class ExifToolWriteError(Exception):
+    """ExifTool did not update a file. The message is suitable for the user."""
+
+
+def write_tags(path: Path, values: dict[str, str]) -> None:
+    """Write tag values (numeric, as with ``-n``) to ``path``.
+
+    The file modification time is kept (``-P``) and ExifTool's backup copy
+    ``<name>_original`` holds the unmodified file; an existing backup from an
+    earlier write is left untouched, so it always holds the first original.
+    """
+    args = ["-n", "-P", *(f"-{tag}={value}" for tag, value in values.items()), str(path)]
+    result = _exec(args, timeout=60)
+    out = result.stdout.decode("utf-8", errors="replace")
+    if result.returncode == 0 and "1 image files updated" in out:
+        return
+    err = result.stderr.decode("utf-8", errors="replace").strip()
+    lines = [line.strip() for line in (err or out).splitlines() if line.strip()]
+    # Prefer ExifTool's own error lines ("Error: ... - file").
+    message = next((ln for ln in lines if ln.startswith("Error")), lines[0] if lines else "")
+    raise ExifToolWriteError(message or "file not updated")

@@ -67,7 +67,11 @@ class MapView(QWebEngineView):
         self._run("clearPosition()")
 
     def set_media_markers(self, markers: list[dict]) -> None:
-        """Show media icons; each marker has ``lat``, ``lon``, ``kind`` (image|file), ``label``."""
+        """Show media icons, clustered when they overlap.
+
+        Each marker has ``lat``, ``lon``, ``kind`` (image|file), ``label`` and
+        ``selected``; selected markers are drawn green, above the others.
+        """
         self._run(f"setMediaMarkers({json.dumps(markers, separators=(',', ':'))})")
 
     def _run(self, script: str) -> None:

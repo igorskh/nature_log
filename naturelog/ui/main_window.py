@@ -5,7 +5,15 @@ from __future__ import annotations
 from datetime import datetime, tzinfo
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QRunnable, QStandardPaths, Qt, QThreadPool, QTimer, Signal
+from PySide6.QtCore import (
+    QObject,
+    QRunnable,
+    QStandardPaths,
+    Qt,
+    QThreadPool,
+    QTimer,
+    Signal,
+)
 from PySide6.QtGui import QCloseEvent, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QFileDialog,
@@ -20,9 +28,18 @@ from PySide6.QtWidgets import (
 )
 
 from naturelog.gps import GpsLogError, Track, load_track, position_at
+from naturelog.inaturalist import ObservationHint, observation_hint
 from naturelog.media import MediaFile
-from naturelog.session import Session, SessionError, SessionMedia, load_session, save_session
+from naturelog.session import (
+    Session,
+    SessionError,
+    SessionMedia,
+    load_session,
+    save_session,
+)
 from naturelog.timezones import format_datetime
+from naturelog.ui.file_datetime_window import FileDatetimeWindow
+from naturelog.ui.inaturalist_window import InaturalistWindow
 from naturelog.ui.map_view import MapView, local_files
 from naturelog.ui.media_sidebar import MediaSidebar
 from naturelog.ui.species_panel import SpeciesPanel
@@ -75,6 +92,7 @@ class MainWindow(QMainWindow):
 
         self._track: Track | None = None
         self._task: _LoadTask | None = None
+        self._inaturalist: InaturalistWindow | None = None
 
         self._session_path = session_file()
         # Save shortly after each change, so a crash loses at most the last edit.
@@ -90,6 +108,12 @@ class MainWindow(QMainWindow):
         self._new_session_button.clicked.connect(self._confirm_new_session)
         self._open_button = QPushButton("Open GPS log…")
         self._open_button.clicked.connect(self._choose_file)
+        self._file_datetime: FileDatetimeWindow | None = None
+        self._file_datetime_button = QPushButton("Map file datetime")
+        self._file_datetime_button.setToolTip(
+            "Copy created/modified dates from source files to matching derived files"
+        )
+        self._file_datetime_button.clicked.connect(self._show_file_datetime)
         self._track_label = QLabel(_NO_TRACK_TEXT)
         # Wrap long track names instead of widening the window.
         self._track_label.setWordWrap(True)
@@ -101,6 +125,7 @@ class MainWindow(QMainWindow):
         top = QHBoxLayout()
         top.addWidget(self._new_session_button)
         top.addWidget(self._open_button)
+        top.addWidget(self._file_datetime_button)
         top.addWidget(self._track_label, 1)
         top.addWidget(QLabel("Timezone:"))
         top.addWidget(self._tz_selector)
@@ -128,6 +153,8 @@ class MainWindow(QMainWindow):
         self._media.selectionChanged.connect(self._update_timeline_markers)
         self._media.filesAdded.connect(self._update_timeline_markers)
         self._media.filesRemoved.connect(self._update_timeline_markers)
+        self._media.filesAdded.connect(self._refresh_map_markers)
+        self._media.filesRemoved.connect(self._refresh_map_markers)
         self._media.filesAdded.connect(self._schedule_save)
         self._media.filesRemoved.connect(self._schedule_save)
         # Previews arrive one by one during large imports: rebuild the timeline
@@ -138,6 +165,7 @@ class MainWindow(QMainWindow):
         self._markers_timer.timeout.connect(self._update_timeline_markers)
         self._media.iconChanged.connect(self._schedule_marker_update)
         self._timeline.markersClicked.connect(self._media.select_paths)
+        self._media.uploadRequested.connect(self._show_inaturalist)
 
         self._species = SpeciesPanel()
         self._species.message.connect(self.statusBar().showMessage)
@@ -271,27 +299,35 @@ class MainWindow(QMainWindow):
 
     # --- media on track -------------------------------------------------
 
-    def _show_media_on_track(self, files: list[MediaFile]) -> None:
-        """Place selected files on the track at their interpolated capture position.
+    def _refresh_map_markers(self, *_args) -> None:
+        self._show_media_on_track(self._media.selected_files(), report=False)
 
+    def _show_media_on_track(self, files: list[MediaFile], report: bool = True) -> None:
+        """Place every listed file on the track at its interpolated capture position.
+
+        ``files`` are the selected ones: they are drawn green, above the others.
         EXIF capture times are read in the selected timezone.
         Files outside the track or in a gap get no marker (no extrapolation).
         """
+        selected = {media.path for media in files}
         markers = []
         outside = 0
-        for media in files if self._track is not None else []:
+        for media in self._media.media_files() if self._track is not None else []:
             when = media.capture_time(self._tz)
             position = position_at(self._track, when)
             if position is None:
-                outside += 1
+                outside += media.path in selected
                 continue
             markers.append({
                 "lat": position.latitude,
                 "lon": position.longitude,
                 "kind": "image" if media.kind.is_image else "file",
                 "label": f"{media.name}\n{format_datetime(when, self._tz)}",
+                "selected": media.path in selected,
             })  # fmt: skip
         self._map.set_media_markers(markers)
+        if not report:
+            return
         if self._track is None and files:
             self.statusBar().showMessage("Load a GPS log to place media on the track")
         elif outside:
@@ -317,7 +353,37 @@ class MainWindow(QMainWindow):
             for media in self._media.media_files()
         ])  # fmt: skip
 
+    def _show_inaturalist(self, files: list[MediaFile]) -> None:
+        """Open (or raise) the iNaturalist upload window; it follows the media selection."""
+        if self._inaturalist is None:
+            self._inaturalist = InaturalistWindow(self, self._observation_hint)
+            self._inaturalist.message.connect(self.statusBar().showMessage)
+            self._media.selectionChanged.connect(self._inaturalist.set_files)
+        self._inaturalist.set_files(files)
+        self._inaturalist.show()
+        self._inaturalist.raise_()
+        self._inaturalist.activateWindow()
+
+    def _observation_hint(self, media: MediaFile) -> ObservationHint | None:
+        """Date, track position and top species to fill in a recording's iNaturalist card."""
+        return observation_hint(
+            media, self._tz, self._track, self._media.detections_for(media)
+        )
+
+    def _show_file_datetime(self) -> None:
+        """Open (or raise) the window that maps file dates from source to target files."""
+        if self._file_datetime is None:
+            self._file_datetime = FileDatetimeWindow(self)
+            self._file_datetime.message.connect(self.statusBar().showMessage)
+        self._file_datetime.show()
+        self._file_datetime.raise_()
+        self._file_datetime.activateWindow()
+
     def closeEvent(self, event: QCloseEvent) -> None:
+        if self._inaturalist is not None:
+            self._inaturalist.close()
+        if self._file_datetime is not None:
+            self._file_datetime.close()
         self._media.shutdown()
         self._species.cancel()
         self._save_timer.stop()

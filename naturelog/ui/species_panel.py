@@ -6,7 +6,16 @@ import threading
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, Signal
+from PySide6.QtCore import (
+    QObject,
+    QRunnable,
+    QSize,
+    QStandardPaths,
+    Qt,
+    QThreadPool,
+    Signal,
+)
+from PySide6.QtGui import QIcon, QImage, QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
     QHBoxLayout,
@@ -29,8 +38,48 @@ from naturelog.species import (
     detector_available,
     summarize,
 )
+from naturelog.species.stickers import CREDIT, CREDIT_URL, StickerStore
 
 _ROLE_PATHS = Qt.ItemDataRole.UserRole
+_ROLE_NAME = Qt.ItemDataRole.UserRole + 1
+_ICON_SIZE = QSize(48, 48)
+
+
+class _StickerSignals(QObject):
+    ready = Signal(str, object)  # scientific name, QImage | None (no sticker)
+    failed = Signal(str)
+    finished = Signal()
+
+
+class _StickerTask(QRunnable):
+    """Loads (and downloads if needed) bird stickers off the UI thread."""
+
+    def __init__(self, store: StickerStore, names: list[tuple[str, str]], size: int) -> None:
+        super().__init__()
+        self.store = store
+        self.names = names  # (scientific name, common name)
+        self.size = size
+        self.signals = _StickerSignals()
+
+    def run(self) -> None:
+        try:
+            for scientific, common in self.names:
+                path = self.store.fetch(scientific, common)
+                image = QImage(str(path)) if path else QImage()
+                if image.isNull():
+                    self.signals.ready.emit(scientific, None)
+                    continue
+                image = image.scaled(
+                    self.size,
+                    self.size,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                self.signals.ready.emit(scientific, image)
+        except (OSError, ValueError) as exc:  # offline, or a broken download
+            self.signals.failed.emit(f"Bird stickers unavailable: {exc}")
+        finally:
+            self.signals.finished.emit()
 
 
 class _DetectSignals(QObject):
@@ -87,6 +136,16 @@ class SpeciesPanel(QWidget):
         self._alive: set[_DetectTask] = set()
         self._detections: Mapping[Path, Sequence[SpeciesPrediction] | None] = {}
 
+        cache = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.CacheLocation)
+        self._stickers = StickerStore(Path(cache) / "bird-stickers")
+        self._sticker_task: _StickerTask | None = None
+        self._sticker_names: list[tuple[str, str]] = []
+        #: Stickers by scientific name; ``None`` once known to have none (or failed).
+        self._sticker_icons: dict[str, QIcon | None] = {}
+        blank = QPixmap(_ICON_SIZE)
+        blank.fill(Qt.GlobalColor.transparent)
+        self._blank_icon = QIcon(blank)  # keeps names aligned while stickers load
+
         title = QLabel("<b>Detected species</b>")
         self._detect_button = QPushButton("Detect species")
         self._detect_button.setToolTip(
@@ -112,12 +171,17 @@ class SpeciesPanel(QWidget):
         self._list = QListWidget()
         self._list.setTextElideMode(Qt.TextElideMode.ElideRight)
         self._list.setSpacing(4)
+        self._list.setIconSize(_ICON_SIZE)
         self._list.itemClicked.connect(self._on_item_clicked)
         self._list.itemActivated.connect(self._on_item_clicked)
 
         self._progress_bar = QProgressBar()
         self._progress_bar.hide()
         self._count_label = QLabel()
+        self._credit_label = QLabel(f'<small><a href="{CREDIT_URL}">{CREDIT}</a></small>')
+        self._credit_label.setOpenExternalLinks(True)
+        self._credit_label.setWordWrap(True)
+        self._credit_label.hide()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -127,6 +191,7 @@ class SpeciesPanel(QWidget):
         layout.addWidget(self._list, 1)
         layout.addWidget(self._progress_bar)
         layout.addWidget(self._count_label)
+        layout.addWidget(self._credit_label)
         self._refresh()
 
     # --- public API -----------------------------------------------------
@@ -220,6 +285,8 @@ class SpeciesPanel(QWidget):
                 f"{s.scientific_name} · {s.best_score:.0%} · {files} file{'s' if files != 1 else ''}"
             )
             item.setData(_ROLE_PATHS, list(s.paths))
+            item.setData(_ROLE_NAME, s.scientific_name)
+            item.setIcon(self._sticker_icons.get(s.scientific_name) or self._blank_icon)
             item.setToolTip(
                 f"{s.display_name} ({s.scientific_name})\n"
                 f"Best probability {s.best_score:.1%}\nClick to select its files"
@@ -229,6 +296,52 @@ class SpeciesPanel(QWidget):
         self._count_label.setText(
             f"{len(summaries)} species · {analysed} file{'s' if analysed != 1 else ''} analysed"
         )
+        self._sticker_names = [(s.scientific_name, s.common_name) for s in summaries]
+        self._load_stickers()
+
+    # --- stickers -------------------------------------------------------
+
+    def _load_stickers(self) -> None:
+        """Fetch stickers not looked up yet; one task at a time, rerun when it ends."""
+        self._credit_label.setVisible(any(self._sticker_icons.values()))
+        if self._sticker_task is not None:
+            return
+        missing = [n for n in self._sticker_names if n[0] not in self._sticker_icons]
+        if not missing:
+            return
+        ratio = max(1.0, self.devicePixelRatioF())
+        task = _StickerTask(self._stickers, missing, round(_ICON_SIZE.width() * ratio))
+        task.signals.ready.connect(self._on_sticker)
+        task.signals.failed.connect(lambda text: self._on_sticker_failed(task, text))
+        task.signals.finished.connect(lambda: self._on_stickers_finished(task))
+        self._sticker_task = task
+        QThreadPool.globalInstance().start(task)
+
+    def _on_sticker(self, scientific_name: str, image: QImage | None) -> None:
+        icon = None
+        if image is not None:
+            pixmap = QPixmap.fromImage(image)
+            pixmap.setDevicePixelRatio(max(1.0, self.devicePixelRatioF()))
+            icon = QIcon(pixmap)
+        self._sticker_icons[scientific_name] = icon
+        if icon is None:
+            return
+        self._credit_label.show()
+        for row in range(self._list.count()):
+            item = self._list.item(row)
+            if item.data(_ROLE_NAME) == scientific_name:
+                item.setIcon(icon)
+
+    def _on_sticker_failed(self, task: _StickerTask, text: str) -> None:
+        # Don't retry in this session: mark what was left as having no sticker.
+        for scientific, _common in task.names:
+            self._sticker_icons.setdefault(scientific, None)
+        self.message.emit(text)
+
+    def _on_stickers_finished(self, task: _StickerTask) -> None:
+        if task is self._sticker_task:
+            self._sticker_task = None
+            self._load_stickers()  # pick up species listed while the task ran
 
     def _on_item_clicked(self, item: QListWidgetItem) -> None:
         self.speciesActivated.emit(item.data(_ROLE_PATHS))

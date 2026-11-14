@@ -32,7 +32,9 @@ class TimeSource(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class MediaFile:
-    """An original media file. The file itself is never modified.
+    """An original media file. The file is only modified on explicit user
+    request (writing GPS tags, see :mod:`naturelog.media.geotag`), which keeps
+    a backup of the original.
 
     ``captured_at`` is timezone-aware for file-system times. EXIF
     ``DateTimeOriginal`` is kept *naive* (the camera's clock reading, any
