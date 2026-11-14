@@ -1,0 +1,37 @@
+[project]
+name = "nature-log"
+version = "0.1.0"
+description = "Local-first manager for georeferenced biodiversity observations"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "gpxpy>=1.6.2",
+    "pillow>=13.0.0",
+    "pyproj>=3.8.0",
+    "pyside6>=6.12.0",
+    "tzdata>=2026.6 ; sys_platform == 'win32'",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]
+
+[project.gui-scripts]
+naturelog = "naturelog.ui.app:main"
+
+[project.optional-dependencies]
+species = [
+    "chirppipe",
+]
+
+[build-system]
+requires = ["uv_build>=0.11,<0.12"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "naturelog"
+module-root = ""
+
+[tool.uv.sources]
+chirppipe = { path = "../chirppipe", editable = true }

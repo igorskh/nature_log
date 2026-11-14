@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>/*LEAFLET_CSS*/</style>
+<style>
+  html, body, #map { height: 100%; margin: 0; }
+  #hint {
+    position: absolute; inset: 0; z-index: 1000; pointer-events: none;
+    display: flex; align-items: center; justify-content: center;
+    font: 15px system-ui, sans-serif; color: #333;
+  }
+  .media-icon {
+    width: 28px; height: 28px; box-sizing: border-box;
+    display: flex; align-items: center; justify-content: center;
+    background: #fff; border: 2px solid #1971c2; border-radius: 7px;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.45);
+  }
+  .media-icon.file { border-color: #5c636a; }
+  .media-icon svg { width: 18px; height: 18px; }
+  #hint span {
+    background: rgba(255, 255, 255, 0.92); padding: 14px 22px;
+    border: 2px dashed #8a8a8a; border-radius: 10px;
+  }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="hint"><span>Drop a GPX or NMEA file here, or use “Open GPS log…”</span></div>
+<script>/*LEAFLET_JS*/</script>
+<script>
+  const map = L.map('map', { preferCanvas: true }).setView([20, 0], 2);
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+  }).addTo(map);
+  L.control.scale().addTo(map);
+
+  let trackLayer = null;
+  let marker = null;
+  const mediaLayer = L.layerGroup().addTo(map);
+
+  const GLYPHS = {
+    image: '<svg viewBox="0 0 24 24" fill="none" stroke="#1971c2" stroke-width="2" ' +
+      'stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/>' +
+      '<circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>',
+    file: '<svg viewBox="0 0 24 24" fill="none" stroke="#5c636a" stroke-width="2" ' +
+      'stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 ' +
+      '2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>'
+  };
+  const ICONS = Object.fromEntries(Object.entries(GLYPHS).map(([kind, svg]) => [kind,
+    L.divIcon({ className: '', html: `<div class="media-icon ${kind}">${svg}</div>`,
+                iconSize: [28, 28], iconAnchor: [14, 14], tooltipAnchor: [14, 0] })]));
+
+  function escapeHtml(text) {
+    return text.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;',
+                                             '"': '&quot;', "'": '&#39;' }[c]));
+  }
+
+  // items: [{lat, lon, kind: 'image' | 'file', label}, ...]
+  function setMediaMarkers(items) {
+    mediaLayer.clearLayers();
+    if (!items.length) { return; }
+    const points = items.map(item => {
+      L.marker([item.lat, item.lon], { icon: ICONS[item.kind] || ICONS.file, zIndexOffset: 1000 })
+        .bindTooltip(escapeHtml(item.label).replace(/\n/g, '<br>'))
+        .addTo(mediaLayer);
+      return [item.lat, item.lon];
+    });
+    const bounds = L.latLngBounds(points);
+    if (!map.getBounds().contains(bounds)) {
+      if (points.length === 1) { map.panTo(points[0]); }
+      else { map.fitBounds(bounds, { padding: [40, 40], maxZoom: map.getZoom() }); }
+    }
+  }
+
+  // segments: [[[lat, lon], ...], ...]
+  function setTrack(segments) {
+    if (trackLayer) { trackLayer.remove(); }
+    clearPosition();
+    trackLayer = L.featureGroup().addTo(map);
+    L.polyline(segments, { color: '#d6336c', weight: 3, opacity: 0.9 }).addTo(trackLayer);
+    const first = segments[0][0];
+    const lastSegment = segments[segments.length - 1];
+    const last = lastSegment[lastSegment.length - 1];
+    const end = { radius: 5, weight: 2, color: '#fff', fillOpacity: 1 };
+    L.circleMarker(first, { ...end, fillColor: '#2f9e44' }).bindTooltip('Start').addTo(trackLayer);
+    L.circleMarker(last, { ...end, fillColor: '#212529' }).bindTooltip('End').addTo(trackLayer);
+    map.fitBounds(trackLayer.getBounds(), { padding: [30, 30] });
+    document.getElementById('hint').style.display = 'none';
+  }
+
+  function clearAll() {
+    if (trackLayer) { trackLayer.remove(); trackLayer = null; }
+    clearPosition();
+    mediaLayer.clearLayers();
+    document.getElementById('hint').style.display = '';
+  }
+
+  function setPosition(lat, lon) {
+    if (!marker) {
+      marker = L.circleMarker([lat, lon], {
+        radius: 8, weight: 3, color: '#fff', fillColor: '#1971c2', fillOpacity: 1
+      }).addTo(map);
+    } else {
+      marker.setLatLng([lat, lon]);
+    }
+    marker.bringToFront();
+  }
+
+  function clearPosition() {
+    if (marker) { marker.remove(); marker = null; }
+  }
+</script>
+</body>
+</html>
