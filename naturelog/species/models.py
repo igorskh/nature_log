@@ -83,6 +83,53 @@ def top_detection(
     return hits[0] if hits else None
 
 
+class ImageModel(StrEnum):
+    """Model that identifies species in photos."""
+
+    BIOCLIP_2 = "bioclip_2"
+
+    @property
+    def label(self) -> str:
+        return {ImageModel.BIOCLIP_2: "BioCLIP 2"}[self]
+
+
+class AudioModel(StrEnum):
+    """Model that identifies species in recordings."""
+
+    BIRDNET_V3 = "birdnet_v3"
+    PERCH_V2 = "perch_v2"
+
+    @property
+    def label(self) -> str:
+        return {AudioModel.BIRDNET_V3: "BirdNET v3", AudioModel.PERCH_V2: "Perch 2"}[self]
+
+
+@dataclass(frozen=True, slots=True)
+class DetectionConfig:
+    """Which models species detection runs with; stored with the session."""
+
+    image_model: ImageModel = ImageModel.BIOCLIP_2
+    audio_model: AudioModel = AudioModel.BIRDNET_V3
+
+    def to_json(self) -> dict[str, Any]:
+        return {"image_model": self.image_model.value, "audio_model": self.audio_model.value}
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any] | None) -> DetectionConfig:
+        """Unknown or missing models fall back to the defaults."""
+        data = data or {}
+        default = cls()
+        try:
+            image = ImageModel(data.get("image_model", default.image_model))
+        except ValueError:
+            image = default.image_model
+        try:
+            audio = AudioModel(data.get("audio_model", default.audio_model))
+        except ValueError:
+            audio = default.audio_model
+        return cls(image, audio)
+
+
 class SpeciesSort(StrEnum):
     PROBABILITY = "probability"
     ALPHABETICAL = "alphabetical"

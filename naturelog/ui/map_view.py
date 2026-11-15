@@ -35,7 +35,7 @@ def local_files(event: QDropEvent) -> list[str]:
 
 
 class MapView(QWebEngineView):
-    """Shows a track and a movable position marker on a Leaflet map."""
+    """Shows GPS tracks and a movable position marker on a Leaflet map."""
 
     #: Local file paths dropped onto the map.
     filesDropped = Signal(list)
@@ -49,12 +49,26 @@ class MapView(QWebEngineView):
         self.loadFinished.connect(self._on_load_finished)
         self.setHtml(_map_html())
 
-    def set_track(self, track: Track) -> None:
-        segments = [
-            [[round(p.latitude, 7), round(p.longitude, 7)] for p in segment.points]
-            for segment in track.segments
+    def set_tracks(self, tracks: list[Track], colors: list[str], fit: bool = True) -> None:
+        """Draw every track in its colour; ``fit`` zooms the map to all of them."""
+        data = [
+            {
+                "name": track.name,
+                "color": color,
+                "segments": [
+                    [[round(p.latitude, 7), round(p.longitude, 7)] for p in segment.points]
+                    for segment in track.segments
+                ],
+            }
+            for track, color in zip(tracks, colors, strict=True)
         ]
-        self._run(f"setTrack({json.dumps(segments, separators=(',', ':'))})")
+        self._run(
+            f"setTracks({json.dumps(data, separators=(',', ':'))}, {'true' if fit else 'false'})"
+        )
+
+    def highlight_tracks(self, indices: list[int]) -> None:
+        """Emphasise and zoom to the tracks at these indices (empty: none emphasised)."""
+        self._run(f"highlightTracks({json.dumps(indices)})")
 
     def clear(self) -> None:
         """Remove the track, position and media markers."""

@@ -27,7 +27,7 @@ class TimeSource(StrEnum):
     """Where :attr:`MediaFile.captured_at` came from."""
 
     EXIF = "exif"  # capture time recorded by the camera (DateTimeOriginal)
-    FILE = "file"  # file-system creation time
+    FILE = "file"  # file-system creation time (wall clock)
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,10 +36,10 @@ class MediaFile:
     request (writing GPS tags, see :mod:`naturelog.media.geotag`), which keeps
     a backup of the original.
 
-    ``captured_at`` is timezone-aware for file-system times. EXIF
-    ``DateTimeOriginal`` is kept *naive* (the camera's clock reading, any
-    recorded offset ignored) and is interpreted in the user-selected timezone
-    via :meth:`capture_time`.
+    ``captured_at`` is kept *naive*: EXIF ``DateTimeOriginal`` is the camera's
+    clock reading (any recorded offset ignored) and file-system times are the
+    wall clock the OS shows. Both are interpreted in the user-selected timezone
+    via :meth:`capture_time`. (Sessions saved earlier may hold aware times.)
     """
 
     path: Path
@@ -48,13 +48,15 @@ class MediaFile:
     time_source: TimeSource
     #: EXIF orientation (1–8) of the original, if known; used for previews.
     orientation: int | None = None
+    #: GPS ``(latitude, longitude)`` stored in the file's EXIF, if any (WGS84, signed).
+    exif_coordinates: tuple[float, float] | None = None
 
     @property
     def name(self) -> str:
         return self.path.name
 
     def capture_time(self, tz: tzinfo) -> datetime:
-        """Timezone-aware capture time; a naive EXIF time is taken to be in ``tz``."""
+        """Timezone-aware capture time; a naive time is taken to be in ``tz``."""
         if self.captured_at.tzinfo is None:
             return self.captured_at.replace(tzinfo=tz)
         return self.captured_at

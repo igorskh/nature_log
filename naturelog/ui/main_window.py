@@ -16,6 +16,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import QCloseEvent, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -23,13 +24,15 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSplitter,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
 
-from naturelog.gps import GpsLogError, Track, load_track, position_at
+from naturelog.gps import GpsLogError, Track, load_track, position_on_tracks, tracks_span
 from naturelog.inaturalist import ObservationHint, observation_hint
 from naturelog.media import MediaFile
+from naturelog.species import DetectionConfig
 from naturelog.session import (
     Session,
     SessionError,
@@ -43,6 +46,7 @@ from naturelog.ui.inaturalist_window import InaturalistWindow
 from naturelog.ui.map_view import MapView, local_files
 from naturelog.ui.media_sidebar import MediaSidebar
 from naturelog.ui.species_panel import SpeciesPanel
+from naturelog.ui.track_sidebar import TrackSidebar, track_colors
 from naturelog.ui.timeline import TimelineMarker, TimelineWidget
 from naturelog.ui.timezone_selector import TimezoneSelector, system_timezone_name
 
@@ -51,6 +55,7 @@ _FILE_FILTER = (
     "GPX (*.gpx);;NMEA 0183 (*.nmea *.nma *.log *.txt);;All files (*)"
 )
 _NO_TRACK_TEXT = "No GPS log loaded"
+_SIDEBAR_PAGES = ("Observations", "Tracks")
 
 
 def session_file() -> Path:
@@ -60,27 +65,28 @@ def session_file() -> Path:
 
 
 class _LoadSignals(QObject):
-    loaded = Signal(object)  # Track
-    failed = Signal(str)
+    loaded = Signal(object, object)  # list[Track], list[str] error messages
 
 
 class _LoadTask(QRunnable):
-    """Parses a GPS log off the UI thread."""
+    """Parses GPS logs off the UI thread; a file that fails does not stop the others."""
 
-    def __init__(self, path: str) -> None:
+    def __init__(self, paths: list[str]) -> None:
         super().__init__()
-        self.path = path
+        self.paths = paths
         self.signals = _LoadSignals()
 
     def run(self) -> None:
-        try:
-            track = load_track(self.path)
-        except GpsLogError as exc:
-            self.signals.failed.emit(str(exc))
-        except Exception as exc:  # report instead of dying silently in a worker
-            self.signals.failed.emit(f"{Path(self.path).name}: unexpected error: {exc}")
-        else:
-            self.signals.loaded.emit(track)
+        tracks: list[Track] = []
+        errors: list[str] = []
+        for path in self.paths:
+            try:
+                tracks.append(load_track(path))
+            except GpsLogError as exc:
+                errors.append(str(exc))
+            except Exception as exc:  # report instead of dying silently in a worker
+                errors.append(f"{Path(path).name}: unexpected error: {exc}")
+        self.signals.loaded.emit(tracks, errors)
 
 
 class MainWindow(QMainWindow):
@@ -90,7 +96,8 @@ class MainWindow(QMainWindow):
         self.resize(1400, 820)
         self.setAcceptDrops(True)
 
-        self._track: Track | None = None
+        #: Loaded tracks sorted by start time; on overlap the earlier one gives positions.
+        self._tracks: list[Track] = []
         self._task: _LoadTask | None = None
         self._inaturalist: InaturalistWindow | None = None
 
@@ -103,10 +110,10 @@ class MainWindow(QMainWindow):
 
         self._new_session_button = QPushButton("New session")
         self._new_session_button.setToolTip(
-            "Clear the GPS log, media list and settings (files on disk are not changed)"
+            "Clear the GPS logs, media list and settings (files on disk are not changed)"
         )
         self._new_session_button.clicked.connect(self._confirm_new_session)
-        self._open_button = QPushButton("Open GPS log…")
+        self._open_button = QPushButton("Add GPS logs…")
         self._open_button.clicked.connect(self._choose_file)
         self._file_datetime: FileDatetimeWindow | None = None
         self._file_datetime_button = QPushButton("Map file datetime")
@@ -167,9 +174,17 @@ class MainWindow(QMainWindow):
         self._timeline.markersClicked.connect(self._media.select_paths)
         self._media.uploadRequested.connect(self._show_inaturalist)
 
+        self._track_panel = TrackSidebar()
+        self._track_panel.addRequested.connect(self._choose_file)
+        self._track_panel.pathsDropped.connect(self._load_files)
+        self._track_panel.removeRequested.connect(self._remove_tracks)
+        self._track_panel.selectionChanged.connect(self._map.highlight_tracks)
+        self._track_panel.set_timezone(self._tz)
+
         self._species = SpeciesPanel()
         self._species.message.connect(self.statusBar().showMessage)
         self._species.detectRequested.connect(self._detect_species)
+        self._species.configChanged.connect(self._schedule_save)
         self._species.detected.connect(self._media.set_detections)
         self._species.speciesActivated.connect(self._media.select_paths)
         self._media.detectRequested.connect(self._species.detect)
@@ -184,7 +199,7 @@ class MainWindow(QMainWindow):
         self._media.detectionsChanged.connect(self._species_timer.start)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(self._media)
+        splitter.addWidget(self._build_sidebar())
         splitter.addWidget(content)
         splitter.addWidget(self._species)
         splitter.setStretchFactor(0, 0)
@@ -195,26 +210,54 @@ class MainWindow(QMainWindow):
 
         self._restore_session()
 
+    # --- sidebar --------------------------------------------------------
+
+    def _build_sidebar(self) -> QWidget:
+        """Left sidebar: a switch between the observations (media) and tracks panels."""
+        stack = QStackedWidget()
+        stack.addWidget(self._media)
+        stack.addWidget(self._track_panel)
+        group = QButtonGroup(self)
+        group.setExclusive(True)
+        switch = QHBoxLayout()
+        switch.setSpacing(0)
+        for index, label in enumerate(_SIDEBAR_PAGES):
+            button = QPushButton(label)
+            button.setCheckable(True)
+            button.setChecked(index == 0)
+            group.addButton(button, index)
+            switch.addWidget(button, 1)
+        group.idToggled.connect(lambda index, on: on and stack.setCurrentIndex(index))
+        self._sidebar_buttons = group
+
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addLayout(switch)
+        layout.addWidget(stack, 1)
+        sidebar = QWidget()
+        sidebar.setLayout(layout)
+        return sidebar
+
     # --- loading --------------------------------------------------------
 
     def _choose_file(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Open GPS log", "", _FILE_FILTER)
-        if path:
-            self._load_files([path])
+        paths, _ = QFileDialog.getOpenFileNames(self, "Add GPS logs", "", _FILE_FILTER)
+        if paths:
+            self._load_files(paths)
 
     def _load_files(self, paths: list[str]) -> None:
         if self._task is not None:
+            self.statusBar().showMessage("GPS logs are already being loaded")
             return
-        path = paths[0]
-        message = f"Loading {Path(path).name}…"
-        if len(paths) > 1:
-            message += f" (only the first of {len(paths)} dropped files is loaded)"
+        if len(paths) == 1:
+            message = f"Loading {Path(paths[0]).name}…"
+        else:
+            message = f"Loading {len(paths)} GPS logs…"
         self.statusBar().showMessage(message)
         self._open_button.setEnabled(False)
         self._new_session_button.setEnabled(False)
-        self._task = _LoadTask(path)
+        self._task = _LoadTask(paths)
         self._task.signals.loaded.connect(self._on_loaded)
-        self._task.signals.failed.connect(self._on_failed)
         QThreadPool.globalInstance().start(self._task)
 
     def _finish_loading(self) -> None:
@@ -223,35 +266,70 @@ class MainWindow(QMainWindow):
         self._new_session_button.setEnabled(True)
         self._schedule_save()
 
-    def _on_failed(self, message: str) -> None:
+    def _on_loaded(self, tracks: list[Track], errors: list[str]) -> None:
+        """Add newly read tracks; a log loaded again replaces its earlier copy."""
         self._finish_loading()
-        self.statusBar().clearMessage()
-        QMessageBox.warning(self, "Cannot load GPS log", message)
+        if tracks:
+            reloaded = {t.source_path for t in tracks}
+            kept = [t for t in self._tracks if t.source_path not in reloaded]
+            self._set_tracks(kept + tracks)
+            if len(tracks) == 1:
+                message = f"Loaded {tracks[0].source_path.name}"
+            else:
+                message = f"Loaded {len(tracks)} GPS logs"
+            skipped = sum(t.skipped_points for t in tracks)
+            if skipped:
+                message += f" – {skipped:,} points without usable timestamp skipped"
+            self.statusBar().showMessage(message)
+            self._timeline.setFocus()
+        else:
+            self.statusBar().clearMessage()
+        if errors:
+            QMessageBox.warning(
+                self,
+                "Cannot load GPS log" if len(errors) == 1 else "Cannot load some GPS logs",
+                "\n\n".join(errors),
+            )
 
-    def _on_loaded(self, track: Track) -> None:
-        self._finish_loading()
-        self._track = track
+    def _remove_tracks(self, paths: list[Path]) -> None:
+        removed = set(paths)
+        remaining = [t for t in self._tracks if t.source_path not in removed]
+        count = len(self._tracks) - len(remaining)
+        self._set_tracks(remaining, fit=False)
+        self.statusBar().showMessage(
+            f"Removed {count} track{'s' if count != 1 else ''} (files on disk are not changed)"
+        )
+
+    def _set_tracks(self, tracks: list[Track], fit: bool = True) -> None:
+        """Show these tracks everywhere and recompute media positions from them."""
+        self._tracks = sorted(tracks, key=lambda t: t.start)
+        self._map.set_tracks(self._tracks, track_colors(len(self._tracks)), fit=fit)
+        self._media.set_tracks(self._tracks)
+        self._track_panel.set_tracks(self._tracks)
+        self._timeline.set_tracks(self._tracks)
+        if not self._tracks:
+            self._position_label.setText(" ")
         self._update_track_label()
-        message = f"Loaded {track.source_path.name}"
-        if track.skipped_points:
-            message += f" – {track.skipped_points:,} points without usable timestamp skipped"
-        self.statusBar().showMessage(message)
-        self._map.set_track(track)
-        self._media.set_track(track)
-        self._timeline.set_track(track)
         self._update_timeline_markers()
-        self._show_media_on_track(self._media.selected_files())
-        self._timeline.setFocus()
+        self._show_media_on_track(self._media.selected_files(), report=False)
+        self._schedule_save()
 
     def _update_track_label(self) -> None:
-        track = self._track
-        if track is None:
+        tracks = self._tracks
+        if not tracks:
+            self._track_label.setText(_NO_TRACK_TEXT)
             return
-        source = "NMEA 0183 → GPX" if track.source_format == "nmea" else "GPX"
+        start, end = tracks_span(tracks)
+        if len(tracks) == 1:
+            track = tracks[0]
+            source = "NMEA 0183 → GPX" if track.source_format == "nmea" else "GPX"
+            title, details = track.name, f"{source} · {track.point_count:,} points"
+        else:
+            points = sum(t.point_count for t in tracks)
+            title, details = f"{len(tracks)} GPS logs", f"{points:,} points"
         self._track_label.setText(
-            f"<b>{track.name}</b><br>"
-            f"{source} · {track.point_count:,} points<br>"
-            f"{format_datetime(track.start, self._tz)} – {format_datetime(track.end, self._tz)}"
+            f"<b>{title}</b><br>{details}<br>"
+            f"{format_datetime(start, self._tz)} – {format_datetime(end, self._tz)}"
         )
 
     # --- timezone -------------------------------------------------------
@@ -261,6 +339,7 @@ class MainWindow(QMainWindow):
         self._schedule_save()
         self._update_track_label()
         self._media.set_timezone(tz)
+        self._track_panel.set_timezone(tz)
         self._show_media_on_track(self._media.selected_files())
         self._timeline.set_timezone(tz)
         self._update_timeline_markers()
@@ -271,13 +350,13 @@ class MainWindow(QMainWindow):
     # --- timeline -------------------------------------------------------
 
     def _on_time_changed(self, when: datetime) -> None:
-        if self._track is None:
+        if not self._tracks:
             return
         stamp = format_datetime(when, self._tz)
-        position = position_at(self._track, when)
+        position = position_on_tracks(self._tracks, when)
         if position is None:
             self._map.clear_position()
-            self._position_label.setText(f"{stamp} · no GPS position (gap in track)")
+            self._position_label.setText(f"{stamp} · no GPS position (gap between or in tracks)")
             return
         self._map.set_position(position.latitude, position.longitude)
         parts = [stamp, f"{position.latitude:.6f}°, {position.longitude:.6f}°"]
@@ -303,7 +382,7 @@ class MainWindow(QMainWindow):
         self._show_media_on_track(self._media.selected_files(), report=False)
 
     def _show_media_on_track(self, files: list[MediaFile], report: bool = True) -> None:
-        """Place every listed file on the track at its interpolated capture position.
+        """Place every listed file on the tracks at its interpolated capture position.
 
         ``files`` are the selected ones: they are drawn green, above the others.
         EXIF capture times are read in the selected timezone.
@@ -312,9 +391,9 @@ class MainWindow(QMainWindow):
         selected = {media.path for media in files}
         markers = []
         outside = 0
-        for media in self._media.media_files() if self._track is not None else []:
+        for media in self._media.media_files() if self._tracks else []:
             when = media.capture_time(self._tz)
-            position = position_at(self._track, when)
+            position = position_on_tracks(self._tracks, when)
             if position is None:
                 outside += media.path in selected
                 continue
@@ -328,7 +407,7 @@ class MainWindow(QMainWindow):
         self._map.set_media_markers(markers)
         if not report:
             return
-        if self._track is None and files:
+        if not self._tracks and files:
             self.statusBar().showMessage("Load a GPS log to place media on the track")
         elif outside:
             self.statusBar().showMessage(
@@ -367,7 +446,7 @@ class MainWindow(QMainWindow):
     def _observation_hint(self, media: MediaFile) -> ObservationHint | None:
         """Date, track position and top species to fill in a recording's iNaturalist card."""
         return observation_hint(
-            media, self._tz, self._track, self._media.detections_for(media)
+            media, self._tz, self._tracks, self._media.detections_for(media)
         )
 
     def _show_file_datetime(self) -> None:
@@ -393,21 +472,24 @@ class MainWindow(QMainWindow):
     # --- session --------------------------------------------------------
 
     def _current_session(self) -> Session:
-        """Settings, GPS log and listed media with the coordinates assigned to them."""
-        track_path = self._track.source_path if self._track is not None else None
-        if self._task is not None:  # a log being loaded replaces the current one
-            track_path = Path(self._task.path)
+        """Settings, GPS logs and listed media with the coordinates assigned to them."""
+        track_paths = [t.source_path for t in self._tracks if t.source_path is not None]
+        if self._task is not None:  # logs being loaded are part of the session too
+            track_paths += [Path(p) for p in self._task.paths if Path(p) not in track_paths]
         media = [
             SessionMedia(
                 m,
-                position_at(self._track, m.capture_time(self._tz))
-                if self._track is not None
-                else None,
+                position_on_tracks(self._tracks, m.capture_time(self._tz)),
                 self._media.detections_for(m),
             )
             for m in self._media.media_files()
         ]
-        return Session(timezone=self._tz_selector.timezone_name(), track_path=track_path, media=media)
+        return Session(
+            timezone=self._tz_selector.timezone_name(),
+            track_paths=track_paths,
+            media=media,
+            detection=self._species.config(),
+        )
 
     def _schedule_save(self, *_args) -> None:
         self._save_timer.start()
@@ -419,7 +501,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Cannot save session: {exc.strerror or exc}")
 
     def _restore_session(self) -> None:
-        """Reopen the GPS log and media of the last session."""
+        """Reopen the GPS logs and media of the last session."""
         try:
             session = load_session(self._session_path)
         except SessionError as exc:
@@ -428,6 +510,7 @@ class MainWindow(QMainWindow):
         if session is None:
             return
         self._tz_selector.select_timezone(session.timezone)
+        self._species.set_config(session.detection)
         files = [entry.media for entry in session.media if entry.media.path.is_file()]
         missing = len(session.media) - len(files)
         self._media.add_media(files)
@@ -440,25 +523,23 @@ class MainWindow(QMainWindow):
         notes = []
         if missing:
             notes.append(f"{missing} media file{'s' if missing != 1 else ''} not found")
-        track_path = session.track_path
-        if track_path is not None and not track_path.is_file():
-            notes.append(f"GPS log {track_path.name} not found")
-            track_path = None
-        if track_path is not None:
-            self._load_files([str(track_path)])
+        track_paths = [p for p in session.track_paths if p.is_file()]
+        notes += [f"GPS log {p.name} not found" for p in session.track_paths if not p.is_file()]
+        if track_paths:
+            self._load_files([str(p) for p in track_paths])
         message = "Restored last session"
         if notes:
             message += " – " + ", ".join(notes)
         self.statusBar().showMessage(message)
 
     def _confirm_new_session(self) -> None:
-        if self._track is None and not self._media.media_files():
+        if not self._tracks and not self._media.media_files():
             self._new_session()
             return
         answer = QMessageBox.question(
             self,
             "New session",
-            "Start a new session? The GPS log, the media list and the coordinates "
+            "Start a new session? The GPS logs, the media list and the coordinates "
             "assigned to them are cleared. Files on disk are not changed.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel,
@@ -470,16 +551,18 @@ class MainWindow(QMainWindow):
         """Clear everything and return to default settings."""
         if self._task is not None:  # button is disabled while a log loads
             return
-        self._track = None
+        self._tracks = []
         self._species.cancel()
         self._media.clear()
-        self._media.set_track(None)
+        self._media.set_tracks([])
+        self._track_panel.set_tracks([])
         self._map.clear()
-        self._timeline.set_track(None)
+        self._timeline.set_tracks([])
         self._timeline.set_markers([])
         self._track_label.setText(_NO_TRACK_TEXT)
         self._position_label.setText(" ")
         self._tz_selector.select_timezone(system_timezone_name())
+        self._species.set_config(DetectionConfig())
         self._save_timer.stop()
         self._save_session()
         self.statusBar().showMessage("New session started")

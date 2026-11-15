@@ -1,5 +1,6 @@
 """GPS track loading, conversion and interpolation. Independent of Qt."""
 
+from naturelog.gps.collection import position_on_tracks, tracks_span
 from naturelog.gps.interpolation import TrackPosition, position_at
 from naturelog.gps.loader import GpsLogError, load_track
 from naturelog.gps.models import Track, TrackPoint, TrackSegment
@@ -12,4 +13,6 @@ __all__ = [
     "TrackSegment",
     "load_track",
     "position_at",
+    "position_on_tracks",
+    "tracks_span",
 ]

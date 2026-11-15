@@ -13,7 +13,7 @@ from datetime import datetime, tzinfo
 from pathlib import Path
 from typing import Any
 
-from naturelog.gps import Track, position_at
+from naturelog.gps import Track, position_on_tracks
 from naturelog.media.models import MediaFile, MediaKind
 from naturelog.species import SpeciesPrediction, top_detection
 
@@ -111,18 +111,18 @@ class ObservationHint:
 def observation_hint(
     media: MediaFile,
     tz: tzinfo,
-    track: Track | None,
+    tracks: Sequence[Track],
     predictions: Sequence[SpeciesPrediction] | None,
 ) -> ObservationHint | None:
     """Suggested card values for a recording; ``None`` for other files.
 
-    The location comes from the GPS track at the capture time (no position
+    The location comes from the GPS tracks at the capture time (no position
     outside the track, never extrapolated).
     """
     if media.kind is not MediaKind.AUDIO:
         return None
     when = media.capture_time(tz)
-    position = position_at(track, when) if track is not None else None
+    position = position_on_tracks(tracks, when)
     species = top_detection(predictions)
     return ObservationHint(
         observed_at=when.astimezone(tz).replace(tzinfo=None),

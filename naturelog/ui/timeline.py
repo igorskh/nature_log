@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone, tzinfo
 
@@ -20,7 +21,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QSizePolicy, QToolTip, QWidget
 
-from naturelog.gps.models import Track
+from naturelog.gps import Track, tracks_span
 
 _MARGIN = 24
 _ICON_TOP = 4
@@ -77,7 +78,9 @@ class TimelineWidget(QWidget):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self._track: Track | None = None
+        self._tracks: list[Track] = []
+        #: Earliest start and latest end over all tracks.
+        self._span: tuple[datetime, datetime] | None = None
         self._current: datetime | None = None
         self._tz: tzinfo = timezone.utc
         self._markers: list[TimelineMarker] = []
@@ -90,10 +93,12 @@ class TimelineWidget(QWidget):
     def sizeHint(self) -> QSize:
         return QSize(600, _BAR_TOP + _BAR_HEIGHT + 30)
 
-    def set_track(self, track: Track | None) -> None:
-        self._track = track
+    def set_tracks(self, tracks: Sequence[Track]) -> None:
+        """Span the timeline over all tracks; gaps between and within them stay empty."""
+        self._tracks = list(tracks)
+        self._span = tracks_span(self._tracks)
         self._clusters = None
-        if track is None:
+        if self._span is None:
             self._current = None
             self.setEnabled(False)
             self.unsetCursor()
@@ -102,7 +107,7 @@ class TimelineWidget(QWidget):
         self.setEnabled(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._current = None
-        self.set_time(track.start)
+        self.set_time(self._span[0])
 
     def set_timezone(self, tz: tzinfo) -> None:
         """Set the timezone tick labels are shown in."""
@@ -119,9 +124,9 @@ class TimelineWidget(QWidget):
         return self._current
 
     def set_time(self, when: datetime) -> None:
-        if self._track is None:
+        if self._span is None:
             return
-        when = min(max(when, self._track.start), self._track.end)
+        when = min(max(when, self._span[0]), self._span[1])
         if when != self._current:
             self._current = when
             self.update()
@@ -134,15 +139,15 @@ class TimelineWidget(QWidget):
 
     def _x(self, when: datetime) -> float:
         bar = self._bar()
-        span = (self._track.end - self._track.start).total_seconds()
+        span = (self._span[1] - self._span[0]).total_seconds()
         if span <= 0:
             return bar.center().x()
-        return bar.left() + (when - self._track.start).total_seconds() / span * bar.width()
+        return bar.left() + (when - self._span[0]).total_seconds() / span * bar.width()
 
     def _time_at(self, x: float) -> datetime:
         bar = self._bar()
         fraction = min(max((x - bar.left()) / bar.width(), 0.0), 1.0)
-        return self._track.start + (self._track.end - self._track.start) * fraction
+        return self._span[0] + (self._span[1] - self._span[0]) * fraction
 
     def resizeEvent(self, event) -> None:
         self._clusters = None
@@ -153,9 +158,9 @@ class TimelineWidget(QWidget):
         if self._clusters is not None:
             return self._clusters
         clusters: list[_Cluster] = []
-        if self._track is not None:
+        if self._span is not None:
             for marker in self._markers:
-                if not self._track.start <= marker.when <= self._track.end:
+                if not self._span[0] <= marker.when <= self._span[1]:
                     continue  # never place media beyond the recorded track
                 x = self._x(marker.when)
                 clusters.append(_Cluster(x, [marker], [x]))
@@ -192,7 +197,7 @@ class TimelineWidget(QWidget):
     # --- interaction ----------------------------------------------------
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
-        if self._track is not None and event.button() == Qt.MouseButton.LeftButton:
+        if self._span is not None and event.button() == Qt.MouseButton.LeftButton:
             self.setFocus()
             cluster = self._cluster_at(event.position())
             if cluster is not None:
@@ -202,7 +207,7 @@ class TimelineWidget(QWidget):
                 self.set_time(self._time_at(event.position().x()))
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        if self._track is not None and event.buttons() & Qt.MouseButton.LeftButton:
+        if self._span is not None and event.buttons() & Qt.MouseButton.LeftButton:
             self.set_time(self._time_at(event.position().x()))
 
     def event(self, event: QEvent) -> bool:
@@ -231,9 +236,9 @@ class TimelineWidget(QWidget):
             case Qt.Key.Key_Right:
                 self.set_time(self._current + timedelta(seconds=seconds))
             case Qt.Key.Key_Home:
-                self.set_time(self._track.start)
+                self.set_time(self._span[0])
             case Qt.Key.Key_End:
-                self.set_time(self._track.end)
+                self.set_time(self._span[1])
             case _:
                 super().keyPressEvent(event)
 
@@ -252,7 +257,7 @@ class TimelineWidget(QWidget):
         painter.setBrush(palette.color(QPalette.ColorRole.Base))
         painter.drawRoundedRect(bar, 3, 3)
 
-        if self._track is None:
+        if self._span is None:
             painter.setPen(muted)
             painter.drawText(
                 self.rect(), Qt.AlignmentFlag.AlignCenter, "Load a GPS log to see its timeline"
@@ -263,7 +268,7 @@ class TimelineWidget(QWidget):
         accent = palette.color(QPalette.ColorRole.Highlight)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(accent)
-        for segment in self._track.segments:
+        for segment in (s for t in self._tracks for s in t.segments):
             left = self._x(segment.start)
             width = max(2.0, self._x(segment.end) - left)
             painter.drawRect(QRectF(left, bar.top() + 1, width, bar.height() - 2))
@@ -341,7 +346,7 @@ class TimelineWidget(QWidget):
         painter.restore()
 
     def _paint_ticks(self, painter: QPainter, bar: QRectF, text: QColor, muted: QColor) -> None:
-        start, end = self._track.start, self._track.end
+        start, end = self._span[0], self._span[1]
         span = (end - start).total_seconds()
         if span <= 0:
             return

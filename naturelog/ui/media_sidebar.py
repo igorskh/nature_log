@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import threading
 from datetime import UTC, tzinfo
 from pathlib import Path
@@ -12,6 +13,7 @@ from PySide6.QtCore import (
     QObject,
     QPointF,
     QRect,
+    QRectF,
     QRunnable,
     QSize,
     Qt,
@@ -49,7 +51,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from naturelog.gps import Track, TrackPosition, position_at
+from naturelog.gps import Track, TrackPosition, position_on_tracks
 from naturelog.media import (
     MediaFile,
     MediaKind,
@@ -60,6 +62,7 @@ from naturelog.media import (
 )
 from naturelog.media.edit_datetime import DatetimeEdit, EditResult, edit_datetimes
 from naturelog.media.exiftool import exiftool_path
+from naturelog.media.formats import has_exif
 from naturelog.media.geotag import GeotagResult, can_geotag, write_coordinates
 from naturelog.species import SpeciesPrediction, can_detect, detected, top_detection
 from naturelog.timezones import format_datetime
@@ -71,8 +74,14 @@ _THUMB_SIZE = 2 * _ICON_SIZE  # sharp on high-DPI screens
 _ROLE_MEDIA = Qt.ItemDataRole.UserRole
 #: list[SpeciesPrediction] from the last detection run, or None if never run.
 _ROLE_DETECTIONS = Qt.ItemDataRole.UserRole + 1
+#: (stored in file, position from tracks) GPS flags of a listed file.
+_ROLE_GPS = Qt.ItemDataRole.UserRole + 2
 _BADGE_SIZE = 20
 _BADGE_COLOR = QColor(46, 139, 87)
+_GLOBE_SIZE = 18
+#: Globe colours: coordinates stored in the file / interpolated from loaded tracks.
+_GLOBE_STORED = QColor(47, 158, 68)
+_GLOBE_TRACK = QColor(25, 113, 194)
 _COPY_TIME_FORMAT = "%Y/%m/%d %H:%M"
 
 
@@ -183,12 +192,41 @@ class _EditDatetimeTask(QRunnable):
 # --- widgets ------------------------------------------------------------
 
 
+def _paint_globe(painter: QPainter, rect: QRectF, color: QColor) -> None:
+    """A filled globe with meridian and parallels, outlined in white."""
+    painter.save()
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setPen(QPen(Qt.GlobalColor.white, 1.5))
+    painter.setBrush(color)
+    painter.drawEllipse(rect)
+    inner = rect.adjusted(2, 2, -2, -2)
+    pen = QPen(Qt.GlobalColor.white, 1.1)
+    painter.setPen(pen)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    cx, cy = inner.center().x(), inner.center().y()
+    w, h = inner.width(), inner.height()
+    painter.drawEllipse(QRectF(cx - w * 0.22, inner.top(), w * 0.44, h))  # meridian
+    painter.drawLine(QPointF(cx, inner.top()), QPointF(cx, inner.bottom()))
+    painter.drawLine(QPointF(inner.left(), cy), QPointF(inner.right(), cy))  # equator
+    for dy in (-0.27, 0.27):
+        y = cy + h * dy
+        half = w * 0.42
+        painter.drawLine(QPointF(cx - half, y), QPointF(cx + half, y))
+    painter.restore()
+
+
 class _DetectionBadgeDelegate(QStyledItemDelegate):
-    """Draws a badge on the preview of files with a detected species."""
+    """Draws badges on previews: species detected, and where GPS coordinates come from.
+
+    A green globe means the file stores GPS coordinates in its EXIF; a blue
+    globe means a position is interpolated from the loaded tracks.
+    """
 
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
         super().paint(painter, option, index)
-        if top_detection(index.data(_ROLE_DETECTIONS)) is None:
+        stored, on_track = index.data(_ROLE_GPS) or (False, False)
+        detected_species = top_detection(index.data(_ROLE_DETECTIONS)) is not None
+        if not (stored or on_track or detected_species):
             return
         opt = QStyleOptionViewItem(option)
         self.initStyleOption(opt, index)
@@ -196,6 +234,16 @@ class _DetectionBadgeDelegate(QStyledItemDelegate):
         icon_rect = style.subElementRect(
             QStyle.SubElement.SE_ItemViewItemDecoration, opt, opt.widget
         )
+        # Globes along the top edge, from the right: stored (green), then track (blue).
+        x = icon_rect.right() - _GLOBE_SIZE + 3
+        for show, color in ((stored, _GLOBE_STORED), (on_track, _GLOBE_TRACK)):
+            if show:
+                _paint_globe(
+                    painter, QRectF(x, icon_rect.top() - 3, _GLOBE_SIZE, _GLOBE_SIZE), color
+                )
+                x -= _GLOBE_SIZE + 2
+        if not detected_species:
+            return
         badge = QRect(
             icon_rect.right() - _BADGE_SIZE + 3,
             icon_rect.bottom() - _BADGE_SIZE + 3,
@@ -291,7 +339,7 @@ class MediaSidebar(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._tz: tzinfo = UTC
-        self._track: Track | None = None
+        self._tracks: list[Track] = []
         self._items: dict[Path, QListWidgetItem] = {}
         self._tasks: set[QRunnable] = set()
         self._pending_scans = 0
@@ -473,9 +521,11 @@ class MediaSidebar(QWidget):
         )
         self.filesRemoved.emit(removed)
 
-    def set_track(self, track: Track | None) -> None:
-        """GPS track used to look up coordinates of the listed files."""
-        self._track = track
+    def set_tracks(self, tracks: list[Track]) -> None:
+        """GPS tracks used to look up coordinates of the listed files."""
+        self._tracks = list(tracks)
+        for item in self._items.values():
+            self._apply_text(item, item.data(_ROLE_MEDIA))
         self._update_count()
 
     def copy_coordinates(self) -> None:
@@ -486,12 +536,12 @@ class MediaSidebar(QWidget):
         files = self.selected_files()
         if not files:
             return
-        if self._track is None:
+        if not self._tracks:
             self.message.emit("Load a GPS log to get coordinates")
             return
         lines = []
         for media in files:
-            position = position_at(self._track, media.capture_time(self._tz))
+            position = position_on_tracks(self._tracks, media.capture_time(self._tz))
             if position is not None:
                 lines.append(f"{position.latitude:.6f}, {position.longitude:.6f}")
         missing = len(files) - len(lines)
@@ -513,7 +563,7 @@ class MediaSidebar(QWidget):
         files = self.selected_files()
         if not files or self._geotag_running():
             return
-        if self._track is None:
+        if not self._tracks:
             self.message.emit("Load a GPS log to get coordinates")
             return
         if exiftool_path() is None:
@@ -524,7 +574,7 @@ class MediaSidebar(QWidget):
         compatible = [m for m in files if can_geotag(m)]
         items = []
         for media in compatible:
-            position = position_at(self._track, media.capture_time(self._tz))
+            position = position_on_tracks(self._tracks, media.capture_time(self._tz))
             if position is not None:
                 items.append((media, position))
         notes = []
@@ -555,7 +605,11 @@ class MediaSidebar(QWidget):
         if answer != QMessageBox.StandardButton.Yes:
             return
         task = _GeotagTask(items)
-        task.signals.written.connect(lambda results: self._on_written(results, len(files)))
+        task.signals.written.connect(
+            lambda results: self._on_written(results, len(files), dict(
+                (media.path, position) for media, position in items
+            ))
+        )  # fmt: skip
         task.signals.failed.connect(self.message)
         task.signals.progress.connect(lambda done, total: self._on_progress(task, done, total))
         task.signals.finished.connect(lambda: self._on_geotag_finished(task))
@@ -746,7 +800,26 @@ class MediaSidebar(QWidget):
         self._finish(task)
         self._update_count()
 
-    def _on_written(self, results: list[GeotagResult], selected: int) -> None:
+    def _on_written(
+        self, results: list[GeotagResult], selected: int, positions: dict[Path, TrackPosition]
+    ) -> None:
+        # Files written successfully now store these coordinates themselves.
+        updated = []
+        for result in results:
+            item = self._items.get(result.path)
+            position = positions.get(result.path)
+            if result.error is None and item is not None and position is not None:
+                media = dataclasses.replace(
+                    item.data(_ROLE_MEDIA),
+                    exif_coordinates=(position.latitude, position.longitude),
+                )
+                item.setData(_ROLE_MEDIA, media)
+                self._apply_text(item, media)
+                updated.append(media)
+        if updated:
+            self.filesAdded.emit(updated)  # listeners refresh markers and session
+            self._on_selection_changed()
+
         failed = [r for r in results if r.error is not None]
         written = len(results) - len(failed)
         text = f"Wrote coordinates to {written} file{'s' if written != 1 else ''}"
@@ -845,6 +918,18 @@ class MediaSidebar(QWidget):
         source = "captured" if media.time_source is TimeSource.EXIF else "file created"
         lines = [media.name, stamp, source]
         tooltip = [str(media.path)]
+        stored = media.exif_coordinates is not None and has_exif(media.path)
+        track_position = position_on_tracks(self._tracks, media.capture_time(self._tz))
+        item.setData(_ROLE_GPS, (stored, track_position is not None))
+        if stored:
+            lat, lon = media.exif_coordinates
+            tooltip.append(f"GPS stored in file: {lat:.6f}, {lon:.6f}")
+        if track_position is not None:
+            how = "interpolated" if track_position.interpolated else "recorded fix"
+            tooltip.append(
+                f"GPS from tracks ({how}): "
+                f"{track_position.latitude:.6f}, {track_position.longitude:.6f}"
+            )
         predictions = item.data(_ROLE_DETECTIONS)
         hits = detected(predictions)
         if hits:
@@ -891,11 +976,11 @@ class MediaSidebar(QWidget):
         self._remove_button.setEnabled(selected > 0)
         self._remove_action.setEnabled(selected > 0)
         self._clear_selection_action.setEnabled(selected > 0)
-        self._copy_coords_action.setEnabled(selected > 0 and self._track is not None)
+        self._copy_coords_action.setEnabled(selected > 0 and bool(self._tracks))
         self._copy_time_action.setEnabled(selected > 0)
         self._edit_time_action.setEnabled(selected > 0 and not self._edit_running())
         self._detect_action.setEnabled(selected > 0)
-        can_write = selected > 0 and self._track is not None and not self._geotag_running()
+        can_write = selected > 0 and bool(self._tracks) and not self._geotag_running()
         self._write_coords_action.setEnabled(can_write)
         self._write_coords_button.setEnabled(can_write)
         self._select_all_action.setEnabled(count > 0)

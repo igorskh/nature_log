@@ -154,24 +154,51 @@
     }
   }
 
-  // segments: [[[lat, lon], ...], ...]
-  function setTrack(segments) {
-    if (trackLayer) { trackLayer.remove(); }
-    clearPosition();
+  // tracks: [{name, color, segments: [[[lat, lon], ...], ...]}, ...]
+  let trackLines = [];
+  function setTracks(tracks, fit) {
+    if (trackLayer) { trackLayer.remove(); trackLayer = null; }
+    trackLines = [];
+    if (!tracks.length) {
+      clearPosition();
+      document.getElementById('hint').style.display = '';
+      return;
+    }
     trackLayer = L.featureGroup().addTo(map);
-    L.polyline(segments, { color: '#d6336c', weight: 3, opacity: 0.9 }).addTo(trackLayer);
-    const first = segments[0][0];
-    const lastSegment = segments[segments.length - 1];
-    const last = lastSegment[lastSegment.length - 1];
     const end = { radius: 5, weight: 2, color: '#fff', fillOpacity: 1 };
-    L.circleMarker(first, { ...end, fillColor: '#2f9e44' }).bindTooltip('Start').addTo(trackLayer);
-    L.circleMarker(last, { ...end, fillColor: '#212529' }).bindTooltip('End').addTo(trackLayer);
-    map.fitBounds(trackLayer.getBounds(), { padding: [30, 30] });
+    for (const track of tracks) {
+      const name = escapeHtml(track.name);
+      const line = L.polyline(track.segments, { color: track.color, weight: 3, opacity: 0.9 })
+        .bindTooltip(name, { sticky: true }).addTo(trackLayer);
+      trackLines.push(line);
+      const first = track.segments[0][0];
+      const lastSegment = track.segments[track.segments.length - 1];
+      const last = lastSegment[lastSegment.length - 1];
+      L.circleMarker(first, { ...end, fillColor: '#2f9e44' }).bindTooltip(`${name} – start`).addTo(trackLayer);
+      L.circleMarker(last, { ...end, fillColor: '#212529' }).bindTooltip(`${name} – end`).addTo(trackLayer);
+    }
+    if (fit) { map.fitBounds(trackLayer.getBounds(), { padding: [30, 30] }); }
+    if (marker) { marker.bringToFront(); }
     document.getElementById('hint').style.display = 'none';
+  }
+
+  // Emphasise the tracks at these indices (none: all drawn normally) and zoom to them.
+  function highlightTracks(indices) {
+    trackLines.forEach((line, i) => {
+      const on = indices.includes(i);
+      line.setStyle({ weight: on ? 6 : 3, opacity: indices.length && !on ? 0.4 : 0.9 });
+      if (on) { line.bringToFront(); }
+    });
+    const lines = trackLines.filter((_, i) => indices.includes(i));
+    if (lines.length) {
+      map.fitBounds(L.featureGroup(lines).getBounds(), { padding: [30, 30] });
+    }
+    if (marker) { marker.bringToFront(); }
   }
 
   function clearAll() {
     if (trackLayer) { trackLayer.remove(); trackLayer = null; }
+    trackLines = [];
     clearPosition();
     mediaItems = [];
     mediaLayer.clearLayers();

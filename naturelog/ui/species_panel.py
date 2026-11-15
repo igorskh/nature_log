@@ -24,12 +24,14 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QProgressBar,
     QPushButton,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
 from naturelog.media import MediaFile
 from naturelog.species import (
+    DetectionConfig,
     DetectorUnavailable,
     SpeciesDetector,
     SpeciesPrediction,
@@ -39,6 +41,7 @@ from naturelog.species import (
     summarize,
 )
 from naturelog.species.stickers import CREDIT, CREDIT_URL, StickerStore
+from naturelog.ui.detection_config_dialog import DetectionConfigDialog
 
 _ROLE_PATHS = Qt.ItemDataRole.UserRole
 _ROLE_NAME = Qt.ItemDataRole.UserRole + 1
@@ -93,10 +96,13 @@ class _DetectSignals(QObject):
 class _DetectTask(QRunnable):
     """Classifies photos and recordings off the UI thread, emitting each result as it is ready."""
 
-    def __init__(self, detector: SpeciesDetector, files: list[MediaFile]) -> None:
+    def __init__(
+        self, detector: SpeciesDetector, files: list[MediaFile], config: DetectionConfig
+    ) -> None:
         super().__init__()
         self.detector = detector
         self.files = files
+        self.config = config
         self.signals = _DetectSignals()
         self.cancelled = threading.Event()
 
@@ -104,7 +110,7 @@ class _DetectTask(QRunnable):
         total = len(self.files)
         try:
             results = self.detector.detect(
-                self.files, cancelled=self.cancelled, on_loaded=self.signals.loaded.emit
+                self.files, self.config, cancelled=self.cancelled, on_loaded=self.signals.loaded.emit
             )
             for done, (media, predictions) in enumerate(results, 1):
                 self.signals.detected.emit(media.path, predictions)
@@ -127,10 +133,13 @@ class SpeciesPanel(QWidget):
     #: User picked a species; carries the paths of the files it was detected in.
     speciesActivated = Signal(list)
     message = Signal(str)
+    #: User changed the detection models.
+    configChanged = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._detector = SpeciesDetector()
+        self._config = DetectionConfig()
         self._task: _DetectTask | None = None
         #: Keeps running tasks (and their signals) alive, also after a cancel.
         self._alive: set[_DetectTask] = set()
@@ -148,17 +157,17 @@ class SpeciesPanel(QWidget):
 
         title = QLabel("<b>Detected species</b>")
         self._detect_button = QPushButton("Detect species")
-        self._detect_button.setToolTip(
-            "Identify species in the selected files – photos with BioCLIP 2, "
-            "recordings with BirdNET v3 – or in all files not analysed yet "
-            "if nothing is selected"
-        )
         self._detect_button.clicked.connect(self._on_detect_clicked)
+        self._config_button = QToolButton()
+        self._config_button.setText("⚙")
+        self._config_button.setToolTip("Choose the detection models for images and audio")
+        self._config_button.clicked.connect(self._on_config_clicked)
+        self._update_detect_tooltip()
         if not detector_available():
             self._detect_button.setEnabled(False)
-            self._detect_button.setToolTip(
-                "Species detection is not installed – run: uv sync --extra species"
-            )
+        detect_row = QHBoxLayout()
+        detect_row.addWidget(self._detect_button, 1)
+        detect_row.addWidget(self._config_button)
 
         self._sort = QComboBox()
         self._sort.addItem("Probability", SpeciesSort.PROBABILITY)
@@ -186,7 +195,7 @@ class SpeciesPanel(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(title)
-        layout.addWidget(self._detect_button)
+        layout.addLayout(detect_row)
         layout.addLayout(sort_row)
         layout.addWidget(self._list, 1)
         layout.addWidget(self._progress_bar)
@@ -195,6 +204,14 @@ class SpeciesPanel(QWidget):
         self._refresh()
 
     # --- public API -----------------------------------------------------
+
+    def config(self) -> DetectionConfig:
+        return self._config
+
+    def set_config(self, config: DetectionConfig) -> None:
+        """Models used by the next detection run (does not emit ``configChanged``)."""
+        self._config = config
+        self._update_detect_tooltip()
 
     def is_running(self) -> bool:
         return self._task is not None
@@ -213,7 +230,7 @@ class SpeciesPanel(QWidget):
         if not supported:
             self.message.emit("No photos or recordings to detect species in")
             return
-        task = _DetectTask(self._detector, supported)
+        task = _DetectTask(self._detector, supported, self._config)
         task.signals.loaded.connect(lambda: self._on_loaded(task))
         task.signals.detected.connect(lambda path, preds: self._on_detected(task, path, preds))
         task.signals.progress.connect(lambda done, total: self._on_progress(task, done, total))
@@ -238,6 +255,32 @@ class SpeciesPanel(QWidget):
 
     def _on_detect_clicked(self) -> None:
         self.detectRequested.emit()
+
+    def _on_config_clicked(self) -> None:
+        dialog = DetectionConfigDialog(self._config, self)
+        if dialog.exec() != DetectionConfigDialog.DialogCode.Accepted:
+            return
+        config = dialog.config()
+        if config != self._config:
+            self.set_config(config)
+            self.configChanged.emit()
+            self.message.emit(
+                f"Species detection: images with {config.image_model.label}, "
+                f"audio with {config.audio_model.label}"
+            )
+
+    def _update_detect_tooltip(self) -> None:
+        if not detector_available():
+            self._detect_button.setToolTip(
+                "Species detection is not installed – run: uv sync --extra species"
+            )
+            return
+        self._detect_button.setToolTip(
+            f"Identify species in the selected files – photos with "
+            f"{self._config.image_model.label}, recordings with "
+            f"{self._config.audio_model.label} – or in all files not analysed yet "
+            "if nothing is selected"
+        )
 
     def _on_loaded(self, task: _DetectTask) -> None:
         if task is self._task:

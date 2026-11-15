@@ -30,8 +30,9 @@ def can_set_created() -> bool:
 class DatetimeEdit:
     """Which dates to set. ``when`` must be timezone-aware.
 
-    EXIF ``DateTimeOriginal`` is written as the wall-clock time of ``when`` in
-    its own timezone (no offset), matching how NatureLog reads it.
+    EXIF ``DateTimeOriginal`` and the file-system dates are written as the
+    wall-clock time of ``when`` in its own timezone (no shift), matching how
+    NatureLog reads them: file dates then show that wall-clock time in the OS.
     """
 
     when: datetime
@@ -57,7 +58,8 @@ class EditResult:
 
 def edit_file_datetime(path: Path, edit: DatetimeEdit) -> None:
     """Apply ``edit`` to one file. EXIF is skipped for formats without EXIF."""
-    timestamp = edit.when.timestamp()
+    # Naive -> interpreted as system local time, so the OS shows ``when``'s wall clock.
+    timestamp = edit.when.replace(tzinfo=None).timestamp()
     # Remember the creation date: rewriting the file for EXIF may reset it.
     old_created = creation_time(path) if can_set_created() else None
 

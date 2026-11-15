@@ -138,7 +138,8 @@ class EditDatetimeDialog(QDialog):
 
     def _current_values(self, media: MediaFile) -> tuple[str, str, str]:
         def fmt(timestamp: float) -> str:
-            return format_datetime(datetime.fromtimestamp(timestamp).astimezone(), self._tz)
+            # File dates are wall-clock times in the selected timezone (no shift).
+            return format_datetime(datetime.fromtimestamp(timestamp).replace(tzinfo=self._tz), self._tz)
 
         try:
             created = fmt(creation_time(media.path))

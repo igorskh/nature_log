@@ -1,12 +1,12 @@
-"""Working session: settings, loaded GPS log and media with their coordinates.
+"""Working session: settings, loaded GPS logs and media with their coordinates.
 
 The session is saved as a small JSON file so the application can restore the
 last state when it starts again. Independent of Qt.
 
 Original media and GPS files are only referenced by path, never copied or
 modified. Coordinates stored with each media file are a snapshot of the
-position interpolated from the GPS log when the session was saved; on restore
-they are recomputed from the reloaded log.
+position interpolated from the GPS logs when the session was saved; on restore
+they are recomputed from the reloaded logs.
 """
 
 from __future__ import annotations
@@ -20,10 +20,12 @@ from typing import Any
 
 from naturelog.gps import TrackPosition
 from naturelog.media import MediaFile, MediaKind, TimeSource
-from naturelog.species import SpeciesPrediction
+from naturelog.species import DetectionConfig, SpeciesPrediction
 from naturelog.timezones import UTC_NAME, get_timezone
 
-SESSION_VERSION = 1
+SESSION_VERSION = 2
+#: Older versions that can still be read (v1 had a single ``track``).
+_READABLE_VERSIONS = (1, 2)
 
 
 class SessionError(Exception):
@@ -44,9 +46,11 @@ class SessionMedia:
 class Session:
     #: IANA name of the timezone camera clocks and displayed times are read in.
     timezone: str = UTC_NAME
-    #: GPS log the media are matched against.
-    track_path: Path | None = None
+    #: GPS logs the media are matched against, in lookup priority order.
+    track_paths: list[Path] = field(default_factory=list)
     media: list[SessionMedia] = field(default_factory=list)
+    #: Models species detection runs with.
+    detection: DetectionConfig = field(default_factory=DetectionConfig)
 
 
 # --- serialisation ----------------------------------------------------------
@@ -85,6 +89,9 @@ def _media_to_json(entry: SessionMedia) -> dict[str, Any]:
         "captured_at": media.captured_at.isoformat(),
         "time_source": media.time_source.value,
         "orientation": media.orientation,
+        "exif_coordinates": None
+        if media.exif_coordinates is None
+        else list(media.exif_coordinates),
         "position": _position_to_json(entry.position),
         "detections": None
         if entry.detections is None
@@ -93,12 +100,14 @@ def _media_to_json(entry: SessionMedia) -> dict[str, Any]:
 
 
 def _media_from_json(data: dict[str, Any]) -> SessionMedia:
+    coords = data.get("exif_coordinates")
     media = MediaFile(
         path=Path(data["path"]),
         kind=MediaKind(data["kind"]),
         captured_at=datetime.fromisoformat(data["captured_at"]),
         time_source=TimeSource(data["time_source"]),
         orientation=data.get("orientation"),
+        exif_coordinates=None if coords is None else (float(coords[0]), float(coords[1])),
     )
     detections = data.get("detections")
     return SessionMedia(
@@ -111,23 +120,27 @@ def _media_from_json(data: dict[str, Any]) -> SessionMedia:
 def session_to_json(session: Session) -> dict[str, Any]:
     return {
         "version": SESSION_VERSION,
-        "settings": {"timezone": session.timezone},
-        "track": None if session.track_path is None else {"path": str(session.track_path)},
+        "settings": {"timezone": session.timezone, "detection": session.detection.to_json()},
+        "tracks": [{"path": str(path)} for path in session.track_paths],
         "media": [_media_to_json(entry) for entry in session.media],
     }
 
 
 def session_from_json(data: dict[str, Any]) -> Session:
-    if data.get("version") != SESSION_VERSION:
+    if data.get("version") not in _READABLE_VERSIONS:
         raise SessionError(f"Unsupported session version: {data.get('version')!r}")
-    timezone = data.get("settings", {}).get("timezone", UTC_NAME)
+    settings = data.get("settings", {})
+    timezone = settings.get("timezone", UTC_NAME)
     if get_timezone(timezone) is None:
         timezone = UTC_NAME
-    track = data.get("track")
+    tracks = data.get("tracks")
+    if tracks is None:  # version 1
+        tracks = [data["track"]] if data.get("track") else []
     return Session(
         timezone=timezone,
-        track_path=Path(track["path"]) if track else None,
+        track_paths=[Path(track["path"]) for track in tracks],
         media=[_media_from_json(item) for item in data.get("media", [])],
+        detection=DetectionConfig.from_json(settings.get("detection")),
     )
 
 
