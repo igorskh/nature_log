@@ -333,6 +333,8 @@ class MediaSidebar(QWidget):
     detectRequested = Signal(list)
     #: User asked to upload these selected :class:`MediaFile` objects to iNaturalist.
     uploadRequested = Signal(list)
+    #: User double-clicked a file to preview it; carries the :class:`MediaFile`.
+    previewRequested = Signal(object)
     #: Status messages for the main window's status bar.
     message = Signal(str)
 
@@ -365,6 +367,9 @@ class MediaSidebar(QWidget):
         self._list = _MediaList()
         self._list.pathsDropped.connect(self.add_paths)
         self._list.itemSelectionChanged.connect(self._on_selection_changed)
+        self._list.itemDoubleClicked.connect(
+            lambda item: self.previewRequested.emit(item.data(_ROLE_MEDIA))
+        )
 
         # Actions live on the list: shortcuts work while it has focus, and they
         # form its right-click menu.
@@ -447,6 +452,18 @@ class MediaSidebar(QWidget):
 
     def selected_files(self) -> list[MediaFile]:
         return [item.data(_ROLE_MEDIA) for item in self._list.selectedItems()]
+
+    def count(self) -> int:
+        return self._list.count()
+
+    def row_of(self, media: MediaFile) -> int | None:
+        """Position of a listed file in the (capture-time sorted) list."""
+        item = self._items.get(media.path)
+        return None if item is None else self._list.row(item)
+
+    def file_at(self, row: int) -> MediaFile | None:
+        item = self._list.item(row) if 0 <= row < self._list.count() else None
+        return None if item is None else item.data(_ROLE_MEDIA)
 
     def icon_for(self, media: MediaFile) -> QIcon:
         """Preview icon of a listed file (placeholder until its thumbnail is ready)."""

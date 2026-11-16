@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSplitter,
     QStackedWidget,
+    QToolBar,
     QVBoxLayout,
     QWidget,
 )
@@ -45,6 +46,7 @@ from naturelog.ui.file_datetime_window import FileDatetimeWindow
 from naturelog.ui.inaturalist_window import InaturalistWindow
 from naturelog.ui.map_view import MapView, local_files
 from naturelog.ui.media_sidebar import MediaSidebar
+from naturelog.ui.preview_window import PreviewWindow
 from naturelog.ui.species_panel import SpeciesPanel
 from naturelog.ui.track_sidebar import TrackSidebar, track_colors
 from naturelog.ui.timeline import TimelineMarker, TimelineWidget
@@ -113,8 +115,6 @@ class MainWindow(QMainWindow):
             "Clear the GPS logs, media list and settings (files on disk are not changed)"
         )
         self._new_session_button.clicked.connect(self._confirm_new_session)
-        self._open_button = QPushButton("Add GPS logs…")
-        self._open_button.clicked.connect(self._choose_file)
         self._file_datetime: FileDatetimeWindow | None = None
         self._file_datetime_button = QPushButton("Map file datetime")
         self._file_datetime_button.setToolTip(
@@ -129,10 +129,17 @@ class MainWindow(QMainWindow):
         self._tz_selector.timezoneChanged.connect(self._on_timezone_changed)
         self._tz = self._tz_selector.current_timezone()
 
+        # Session-wide actions live in a fixed bar at the very top of the window.
+        top_bar = QToolBar("Main")
+        top_bar.setObjectName("mainToolBar")
+        top_bar.setMovable(False)
+        top_bar.setFloatable(False)
+        top_bar.toggleViewAction().setVisible(False)
+        top_bar.addWidget(self._new_session_button)
+        top_bar.addWidget(self._file_datetime_button)
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, top_bar)
+
         top = QHBoxLayout()
-        top.addWidget(self._new_session_button)
-        top.addWidget(self._open_button)
-        top.addWidget(self._file_datetime_button)
         top.addWidget(self._track_label, 1)
         top.addWidget(QLabel("Timezone:"))
         top.addWidget(self._tz_selector)
@@ -173,6 +180,9 @@ class MainWindow(QMainWindow):
         self._media.iconChanged.connect(self._schedule_marker_update)
         self._timeline.markersClicked.connect(self._media.select_paths)
         self._media.uploadRequested.connect(self._show_inaturalist)
+        self._preview: PreviewWindow | None = None
+        self._media.previewRequested.connect(self._show_preview)
+        self._media.detectionsChanged.connect(self._refresh_preview_species)
 
         self._track_panel = TrackSidebar()
         self._track_panel.addRequested.connect(self._choose_file)
@@ -254,7 +264,6 @@ class MainWindow(QMainWindow):
         else:
             message = f"Loading {len(paths)} GPS logs…"
         self.statusBar().showMessage(message)
-        self._open_button.setEnabled(False)
         self._new_session_button.setEnabled(False)
         self._task = _LoadTask(paths)
         self._task.signals.loaded.connect(self._on_loaded)
@@ -262,7 +271,6 @@ class MainWindow(QMainWindow):
 
     def _finish_loading(self) -> None:
         self._task = None
-        self._open_button.setEnabled(True)
         self._new_session_button.setEnabled(True)
         self._schedule_save()
 
@@ -340,6 +348,9 @@ class MainWindow(QMainWindow):
         self._update_track_label()
         self._media.set_timezone(tz)
         self._track_panel.set_timezone(tz)
+        if self._preview is not None:
+            self._preview.set_timezone(tz)
+            self._update_preview_position()  # the list is re-sorted by capture time
         self._show_media_on_track(self._media.selected_files())
         self._timeline.set_timezone(tz)
         self._update_timeline_markers()
@@ -448,6 +459,40 @@ class MainWindow(QMainWindow):
         return observation_hint(
             media, self._tz, self._tracks, self._media.detections_for(media)
         )
+
+    def _show_preview(self, media: MediaFile) -> None:
+        """Open (or raise) the preview window showing ``media``."""
+        if self._preview is None:
+            self._preview = PreviewWindow(self)
+            self._preview.navigateRequested.connect(self._navigate_preview)
+            self._media.filesAdded.connect(self._update_preview_position)
+            self._media.filesRemoved.connect(self._update_preview_position)
+        self._preview.show_media(media, self._tz, self._media.detections_for(media))
+        self._update_preview_position()
+        self._preview.show()
+        self._preview.raise_()
+        self._preview.activateWindow()
+
+    def _navigate_preview(self, step: int) -> None:
+        """Preview the previous/next file of the list and select it there too."""
+        current = self._preview.media() if self._preview is not None else None
+        row = self._media.row_of(current) if current is not None else None
+        target = self._media.file_at(row + step) if row is not None else None
+        if target is None:
+            return
+        self._media.select_paths([target.path])
+        self._preview.show_media(target, self._tz, self._media.detections_for(target))
+        self._update_preview_position()
+
+    def _update_preview_position(self, *_args) -> None:
+        preview = self._preview
+        if preview is not None and preview.media() is not None:
+            preview.set_position(self._media.row_of(preview.media()), self._media.count())
+
+    def _refresh_preview_species(self) -> None:
+        preview = self._preview
+        if preview is not None and preview.isVisible() and preview.media() is not None:
+            preview.set_predictions(self._media.detections_for(preview.media()))
 
     def _show_file_datetime(self) -> None:
         """Open (or raise) the window that maps file dates from source to target files."""

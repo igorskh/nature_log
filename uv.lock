@@ -1392,6 +1392,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "gpxpy" },
+    { name = "numpy" },
     { name = "pillow" },
     { name = "pyproj" },
     { name = "pyside6" },
@@ -1412,6 +1413,7 @@ dev = [
 requires-dist = [
     { name = "chirppipe", marker = "extra == 'species'", editable = "../chirppipe" },
     { name = "gpxpy", specifier = ">=1.6.2" },
+    { name = "numpy", specifier = ">=2.3" },
     { name = "pillow", specifier = ">=13.0.0" },
     { name = "pyproj", specifier = ">=3.8.0" },
     { name = "pyside6", specifier = ">=6.12.0" },

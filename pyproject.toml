@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "gpxpy>=1.6.2",
+    "numpy>=2.3",
     "pillow>=13.0.0",
     "pyproj>=3.8.0",
     "pyside6>=6.12.0",
