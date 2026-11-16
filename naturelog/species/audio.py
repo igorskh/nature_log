@@ -9,6 +9,7 @@ span of the chunk that scored best.
 
 from __future__ import annotations
 
+import os
 import threading
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
@@ -54,11 +55,25 @@ _SPECS: dict[AudioModel, _ModelSpec] = {
 }
 
 
+#: Environment variable pointing to a folder with the audio model files.
+MODELS_DIR_ENV = "NATURELOG_MODELS_DIR"
+
+
 def _models_dir() -> Path:
-    """chirppipe's ``models`` folder (its defaults are relative to the working directory)."""
+    """Folder with the ONNX model and labels files.
+
+    Order: ``$NATURELOG_MODELS_DIR``; the ``models`` folder of a local chirppipe
+    checkout (editable install); ``models/`` in the NatureLog project root, which
+    is also where the files are expected when chirppipe is installed from git.
+    """
+    if env := os.environ.get(MODELS_DIR_ENV):
+        return Path(env).expanduser()
     import chirps
 
-    return Path(chirps.__file__).resolve().parent.parent / "models"
+    checkout = Path(chirps.__file__).resolve().parent.parent / "models"
+    if checkout.is_dir():
+        return checkout
+    return Path(__file__).resolve().parents[2] / "models"
 
 
 def _prediction(label: str, score: float, span: tuple[float, float]) -> SpeciesPrediction:
@@ -98,7 +113,7 @@ class AudioDetector:
             if missing:
                 raise DetectorUnavailable(
                     f"{name} model files missing in {models}: {', '.join(missing)} "
-                    "(see chirppipe models/README.md)"
+                    f"(download them as described in chirppipe's models/README.md, or set {MODELS_DIR_ENV})"
                 )
             predictor = ONNXBioacousticsPredictor()
             predictor.configure({

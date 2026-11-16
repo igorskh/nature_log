@@ -13,6 +13,9 @@ dependencies = [
     "tzdata>=2026.6 ; sys_platform == 'win32'",
 ]
 
+[project.urls]
+Repository = "https://github.com/igorskh/nature_log"
+
 [dependency-groups]
 dev = [
     "pytest>=9.2.0",
@@ -35,4 +38,4 @@ module-name = "naturelog"
 module-root = ""
 
 [tool.uv.sources]
-chirppipe = { path = "../chirppipe", editable = true }
+chirppipe = { git = "https://github.com/igorskh/ChirpPipe", branch = "main" }
