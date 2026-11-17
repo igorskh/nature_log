@@ -4,6 +4,8 @@ Local-first desktop app for georeferenced biodiversity observations: import GPX
 tracks, photos and audio, geotag media, group observations and prepare uploads
 to iNaturalist.
 
+![NatureLog main window](docs/screenshot.webp)
+
 ## Setup
 
 Requires [uv](https://docs.astral.sh/uv/) and Python 3.14+.
