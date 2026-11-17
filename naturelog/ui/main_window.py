@@ -58,6 +58,24 @@ _FILE_FILTER = (
 )
 _NO_TRACK_TEXT = "No GPS log loaded"
 _SIDEBAR_PAGES = ("Observations", "Tracks")
+# Sidebar sections look like tabs (underlined, larger text), not like action buttons.
+_SECTION_SWITCH_STYLE = """
+#sectionSwitch { border-bottom: 1px solid palette(mid); }
+#sectionSwitch QPushButton {
+    background: transparent;
+    border: none;
+    border-bottom: 3px solid transparent;
+    padding: 8px 4px 6px 4px;
+    font-size: 15px;
+    color: palette(window-text);
+}
+#sectionSwitch QPushButton:hover { background: palette(alternate-base); }
+#sectionSwitch QPushButton:checked {
+    font-weight: bold;
+    color: palette(highlight);
+    border-bottom: 3px solid palette(highlight);
+}
+"""
 
 
 def session_file() -> Path:
@@ -229,20 +247,27 @@ class MainWindow(QMainWindow):
         stack.addWidget(self._track_panel)
         group = QButtonGroup(self)
         group.setExclusive(True)
-        switch = QHBoxLayout()
-        switch.setSpacing(0)
+        switch = QWidget()
+        switch.setObjectName("sectionSwitch")
+        switch.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
+        switch.setStyleSheet(_SECTION_SWITCH_STYLE)
+        switch_layout = QHBoxLayout(switch)
+        switch_layout.setContentsMargins(0, 0, 0, 0)
+        switch_layout.setSpacing(0)
         for index, label in enumerate(_SIDEBAR_PAGES):
             button = QPushButton(label)
             button.setCheckable(True)
             button.setChecked(index == 0)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
             group.addButton(button, index)
-            switch.addWidget(button, 1)
+            switch_layout.addWidget(button, 1)
         group.idToggled.connect(lambda index, on: on and stack.setCurrentIndex(index))
         self._sidebar_buttons = group
 
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addLayout(switch)
+        layout.setSpacing(6)
+        layout.addWidget(switch)
         layout.addWidget(stack, 1)
         sidebar = QWidget()
         sidebar.setLayout(layout)
