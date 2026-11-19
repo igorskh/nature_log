@@ -8,6 +8,10 @@ modified. Coordinates stored with each media file are a snapshot of the
 position interpolated from the GPS logs when the session was saved; on restore
 they are recomputed from the reloaded logs. A position the user moved a file
 to on the map is kept separately and replaces the track position.
+
+Paths are stored absolute, or relative to the session file's folder so a
+session saved next to its data keeps working when the folder is moved or
+copied to another computer.
 """
 
 from __future__ import annotations
@@ -24,9 +28,10 @@ from naturelog.media import MediaFile, MediaKind, TimeSource
 from naturelog.species import DetectionConfig, SpeciesPrediction
 from naturelog.timezones import UTC_NAME, get_timezone
 
-SESSION_VERSION = 2
-#: Older versions that can still be read (v1 had a single ``track``).
-_READABLE_VERSIONS = (1, 2)
+SESSION_VERSION = 3
+#: Older versions that can still be read (v1 had a single ``track``, v2 only
+#: absolute paths).
+_READABLE_VERSIONS = (1, 2, 3)
 
 
 class SessionError(Exception):
@@ -56,6 +61,39 @@ class Session:
     detection: DetectionConfig = field(default_factory=DetectionConfig)
 
 
+# --- paths ------------------------------------------------------------------
+
+
+def _relative(path: Path, base: Path) -> str | None:
+    """``path`` relative to the folder ``base`` (POSIX separators), or ``None``
+    if it has none (another drive on Windows)."""
+    try:
+        return Path(os.path.relpath(path.absolute(), base.absolute())).as_posix()
+    except ValueError:
+        return None
+
+
+def can_use_relative_paths(session: Session, folder: Path) -> bool:
+    """Whether every file of ``session`` can be stored relative to ``folder``."""
+    paths = [*session.track_paths, *(entry.media.path for entry in session.media)]
+    return all(_relative(path, folder) is not None for path in paths)
+
+
+def _path_to_json(path: Path, base: Path | None) -> str:
+    if base is not None:
+        relative = _relative(path, base)
+        if relative is not None:
+            return relative
+    return str(path.absolute())
+
+
+def _path_from_json(text: str, base: Path | None) -> Path:
+    path = Path(text)
+    if path.is_absolute() or base is None:
+        return path
+    return Path(os.path.normpath(base / path))
+
+
 # --- serialisation ----------------------------------------------------------
 
 
@@ -83,10 +121,10 @@ def _position_from_json(data: dict[str, Any] | None) -> TrackPosition | None:
     )
 
 
-def _media_to_json(entry: SessionMedia) -> dict[str, Any]:
+def _media_to_json(entry: SessionMedia, base: Path | None) -> dict[str, Any]:
     media = entry.media
     return {
-        "path": str(media.path),
+        "path": _path_to_json(media.path, base),
         "kind": media.kind.value,
         # Naive EXIF camera-clock times stay naive (no offset in the string).
         "captured_at": media.captured_at.isoformat(),
@@ -103,10 +141,10 @@ def _media_to_json(entry: SessionMedia) -> dict[str, Any]:
     }
 
 
-def _media_from_json(data: dict[str, Any]) -> SessionMedia:
+def _media_from_json(data: dict[str, Any], base: Path | None) -> SessionMedia:
     coords = data.get("exif_coordinates")
     media = MediaFile(
-        path=Path(data["path"]),
+        path=_path_from_json(data["path"], base),
         kind=MediaKind(data["kind"]),
         captured_at=datetime.fromisoformat(data["captured_at"]),
         time_source=TimeSource(data["time_source"]),
@@ -123,16 +161,21 @@ def _media_from_json(data: dict[str, Any]) -> SessionMedia:
     )
 
 
-def session_to_json(session: Session) -> dict[str, Any]:
+def session_to_json(session: Session, base: Path | None = None) -> dict[str, Any]:
+    """JSON form of ``session``; with ``base``, paths are relative to that folder
+    (where possible)."""
     return {
         "version": SESSION_VERSION,
         "settings": {"timezone": session.timezone, "detection": session.detection.to_json()},
-        "tracks": [{"path": str(path)} for path in session.track_paths],
-        "media": [_media_to_json(entry) for entry in session.media],
+        "relative_paths": base is not None,
+        "tracks": [{"path": _path_to_json(path, base)} for path in session.track_paths],
+        "media": [_media_to_json(entry, base) for entry in session.media],
     }
 
 
-def session_from_json(data: dict[str, Any]) -> Session:
+def session_from_json(data: dict[str, Any], base: Path | None = None) -> Session:
+    """Session from its JSON form; relative paths are resolved against ``base``."""
+
     if data.get("version") not in _READABLE_VERSIONS:
         raise SessionError(f"Unsupported session version: {data.get('version')!r}")
     settings = data.get("settings", {})
@@ -144,8 +187,8 @@ def session_from_json(data: dict[str, Any]) -> Session:
         tracks = [data["track"]] if data.get("track") else []
     return Session(
         timezone=timezone,
-        track_paths=[Path(track["path"]) for track in tracks],
-        media=[_media_from_json(item) for item in data.get("media", [])],
+        track_paths=[_path_from_json(track["path"], base) for track in tracks],
+        media=[_media_from_json(item, base) for item in data.get("media", [])],
         detection=DetectionConfig.from_json(settings.get("detection")),
     )
 
@@ -153,11 +196,16 @@ def session_from_json(data: dict[str, Any]) -> Session:
 # --- files ------------------------------------------------------------------
 
 
-def save_session(session: Session, path: Path) -> None:
-    """Write the session atomically, so a crash never leaves a truncated file."""
+def save_session(session: Session, path: Path, relative_paths: bool = False) -> None:
+    """Write the session atomically, so a crash never leaves a truncated file.
+
+    With ``relative_paths`` file paths are stored relative to the folder of
+    ``path``; a file that has no relative path (another drive) stays absolute.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
+    base = path.parent if relative_paths else None
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(session_to_json(session), indent=1), encoding="utf-8")
+    tmp.write_text(json.dumps(session_to_json(session, base), indent=1), encoding="utf-8")
     os.replace(tmp, path)
 
 
@@ -170,6 +218,6 @@ def load_session(path: Path) -> Session | None:
     except OSError as exc:
         raise SessionError(f"Cannot read session: {exc.strerror or exc}") from exc
     try:
-        return session_from_json(json.loads(text))
+        return session_from_json(json.loads(text), path.absolute().parent)
     except (ValueError, KeyError, TypeError) as exc:
         raise SessionError(f"Session file is damaged: {exc}") from exc

@@ -17,7 +17,9 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QCloseEvent, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QButtonGroup,
+    QComboBox,
     QFileDialog,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -38,6 +40,7 @@ from naturelog.session import (
     Session,
     SessionError,
     SessionMedia,
+    can_use_relative_paths,
     load_session,
     save_session,
 )
@@ -57,6 +60,8 @@ _FILE_FILTER = (
     "GPX (*.gpx);;NMEA 0183 (*.nmea *.nma *.log *.txt);;All files (*)"
 )
 _NO_TRACK_TEXT = "No GPS log loaded"
+_SESSION_SUFFIX = ".naturelog.json"
+_SESSION_FILTER = "NatureLog sessions (*.naturelog.json *.json);;All files (*)"
 _SIDEBAR_PAGES = ("Observations", "Tracks")
 # Sidebar sections look like tabs (underlined, larger text), not like action buttons.
 _SECTION_SWITCH_STYLE = """
@@ -133,6 +138,18 @@ class MainWindow(QMainWindow):
             "Clear the GPS logs, media list and settings (files on disk are not changed)"
         )
         self._new_session_button.clicked.connect(self._confirm_new_session)
+        self._open_session_button = QPushButton("Open session…")
+        self._open_session_button.setToolTip("Replace the current session with a saved session file")
+        self._open_session_button.clicked.connect(self._open_session_file)
+        self._save_session_button = QPushButton("Save session as…")
+        self._save_session_button.setToolTip(
+            "Save GPS logs, media list, coordinates and settings to a session file"
+        )
+        self._save_session_button.clicked.connect(self._save_session_file)
+        #: Session file last opened or saved by the user (suggested by the dialogs).
+        self._session_file: Path | None = None
+        #: Path style last chosen when saving a session file.
+        self._relative_paths = True
         self._file_datetime: FileDatetimeWindow | None = None
         self._file_datetime_button = QPushButton("Map file datetime")
         self._file_datetime_button.setToolTip(
@@ -154,6 +171,8 @@ class MainWindow(QMainWindow):
         top_bar.setFloatable(False)
         top_bar.toggleViewAction().setVisible(False)
         top_bar.addWidget(self._new_session_button)
+        top_bar.addWidget(self._open_session_button)
+        top_bar.addWidget(self._save_session_button)
         top_bar.addWidget(self._file_datetime_button)
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, top_bar)
 
@@ -293,6 +312,7 @@ class MainWindow(QMainWindow):
             message = f"Loading {len(paths)} GPS logs…"
         self.statusBar().showMessage(message)
         self._new_session_button.setEnabled(False)
+        self._open_session_button.setEnabled(False)
         self._task = _LoadTask(paths)
         self._task.signals.loaded.connect(self._on_loaded)
         QThreadPool.globalInstance().start(self._task)
@@ -300,6 +320,7 @@ class MainWindow(QMainWindow):
     def _finish_loading(self) -> None:
         self._task = None
         self._new_session_button.setEnabled(True)
+        self._open_session_button.setEnabled(True)
         self._schedule_save()
 
     def _on_loaded(self, tracks: list[Track], errors: list[str]) -> None:
@@ -595,8 +616,11 @@ class MainWindow(QMainWindow):
         except SessionError as exc:
             self.statusBar().showMessage(f"{exc} – starting a new session")
             return
-        if session is None:
-            return
+        if session is not None:
+            self._apply_session(session, "Restored last session")
+
+    def _apply_session(self, session: Session, message: str) -> None:
+        """Load settings, media and GPS logs of ``session`` into an empty window."""
         self._tz_selector.select_timezone(session.timezone)
         self._species.set_config(session.detection)
         files = [entry.media for entry in session.media if entry.media.path.is_file()]
@@ -620,7 +644,6 @@ class MainWindow(QMainWindow):
         notes += [f"GPS log {p.name} not found" for p in session.track_paths if not p.is_file()]
         if track_paths:
             self._load_files([str(p) for p in track_paths])
-        message = "Restored last session"
         if notes:
             message += " – " + ", ".join(notes)
         self.statusBar().showMessage(message)
@@ -644,6 +667,14 @@ class MainWindow(QMainWindow):
         """Clear everything and return to default settings."""
         if self._task is not None:  # button is disabled while a log loads
             return
+        self._clear_session()
+        self._session_file = None
+        self._save_timer.stop()
+        self._save_session()
+        self.statusBar().showMessage("New session started")
+
+    def _clear_session(self) -> None:
+        """Remove GPS logs and media, and reset the settings to their defaults."""
         self._tracks = []
         self._species.cancel()
         self._media.clear()
@@ -656,9 +687,103 @@ class MainWindow(QMainWindow):
         self._position_label.setText(" ")
         self._tz_selector.select_timezone(system_timezone_name())
         self._species.set_config(DetectionConfig())
-        self._save_timer.stop()
-        self._save_session()
-        self.statusBar().showMessage("New session started")
+
+    def _open_session_file(self) -> None:
+        """Replace the current session with one read from a session file."""
+        if self._task is not None:  # button is disabled while a log loads
+            return
+        start = str(self._session_file.parent) if self._session_file else ""
+        name, _ = QFileDialog.getOpenFileName(
+            self, "Open session", start, _SESSION_FILTER
+        )
+        if not name:
+            return
+        path = Path(name)
+        try:
+            session = load_session(path)
+        except SessionError as exc:
+            QMessageBox.warning(self, "Open session", str(exc))
+            return
+        if session is None:
+            QMessageBox.warning(self, "Open session", f"{path.name} not found")
+            return
+        if self._tracks or self._media.media_files():
+            answer = QMessageBox.question(
+                self,
+                "Open session",
+                f"Replace the current session with {path.name}? Save it first if you "
+                "want to keep it. Files on disk are not changed.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        self._clear_session()
+        self._session_file = path
+        self._apply_session(session, f"Opened session {path.name}")
+        self._schedule_save()
+
+    def _save_session_file(self) -> None:
+        """Save the current session to a file the user chooses, with the path style chosen there."""
+        chosen = self._choose_session_save_path()
+        if chosen is None:
+            return
+        path, relative = chosen
+        if not path.name.endswith(_SESSION_SUFFIX) and path.suffix.lower() != ".json":
+            path = path.with_name(path.name + _SESSION_SUFFIX)
+        session = self._current_session()
+        try:
+            save_session(session, path, relative_paths=relative)
+        except OSError as exc:
+            QMessageBox.warning(self, "Save session", f"Cannot save session: {exc.strerror or exc}")
+            return
+        self._session_file = path
+        self._relative_paths = relative
+        message = f"Saved session {path.name} ({'relative' if relative else 'absolute'} paths)"
+        if relative and not can_use_relative_paths(session, path.parent):
+            message += " – files on another drive are stored with absolute paths"
+        self.statusBar().showMessage(message)
+
+    def _choose_session_save_path(self) -> tuple[Path, bool] | None:
+        """Save dialog with a choice of relative or absolute file paths.
+
+        Returns the chosen file and whether paths are stored relative to it;
+        ``None`` if cancelled. Qt's own dialog is used because native dialogs
+        cannot hold the extra option.
+        """
+        dialog = QFileDialog(self, "Save session")
+        dialog.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+        dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
+        dialog.setFileMode(QFileDialog.FileMode.AnyFile)
+        dialog.setNameFilter(_SESSION_FILTER)
+        dialog.setDefaultSuffix(_SESSION_SUFFIX.lstrip("."))
+        if self._session_file is not None:
+            dialog.setDirectory(str(self._session_file.parent))
+            dialog.selectFile(self._session_file.name)
+        else:
+            dialog.selectFile("session" + _SESSION_SUFFIX)
+
+        paths = QComboBox()
+        paths.addItem("Relative to the session file", True)
+        paths.addItem("Absolute", False)
+        paths.setCurrentIndex(0 if self._relative_paths else 1)
+        paths.setToolTip(
+            "Relative: the session keeps working when its folder is moved or copied "
+            "together with the GPS logs and media (e.g. to another computer).\n"
+            "Absolute: the session keeps working when only the session file is moved, "
+            "as long as the GPS logs and media stay where they are."
+        )
+        layout = dialog.layout()
+        if isinstance(layout, QGridLayout):
+            row = layout.rowCount()
+            layout.addWidget(QLabel("File paths:"), row, 0)
+            layout.addWidget(paths, row, 1)
+        else:  # unexpected dialog layout: still offer the option
+            dialog.layout().addWidget(paths)
+
+        if dialog.exec() != QFileDialog.DialogCode.Accepted or not dialog.selectedFiles():
+            return None
+        return Path(dialog.selectedFiles()[0]), bool(paths.currentData())
 
     # --- drag and drop --------------------------------------------------
 
