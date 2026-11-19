@@ -7,6 +7,7 @@ from pathlib import Path
 
 from PySide6.QtCore import Signal
 from PySide6.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent
+from PySide6.QtWebEngineCore import QWebEnginePage
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
 from naturelog import __version__
@@ -34,16 +35,41 @@ def local_files(event: QDropEvent) -> list[str]:
     return [url.toLocalFile() for url in mime.urls() if url.isLocalFile()]
 
 
+#: Prefix of console lines the map page uses to send messages to the application.
+_MESSAGE_PREFIX = "naturelog:"
+
+
+class _MapPage(QWebEnginePage):
+    """Receives messages the page logs as ``naturelog:{json}`` console lines."""
+
+    message = Signal(dict)
+
+    def javaScriptConsoleMessage(self, level, text: str, line: int, source: str) -> None:
+        if not text.startswith(_MESSAGE_PREFIX):
+            return
+        try:
+            data = json.loads(text[len(_MESSAGE_PREFIX):])
+        except ValueError:
+            return
+        if isinstance(data, dict):
+            self.message.emit(data)
+
+
 class MapView(QWebEngineView):
     """Shows GPS tracks and a movable position marker on a Leaflet map."""
 
     #: Local file paths dropped onto the map.
     filesDropped = Signal(list)
+    #: (latitude, longitude) clicked with the move tool active.
+    moveRequested = Signal(float, float)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._ready = False
         self._queue: list[str] = []
+        page = _MapPage(self)
+        page.message.connect(self._on_message)
+        self.setPage(page)
         # Tile servers require an identifying user agent.
         self.page().profile().setHttpUserAgent(f"NatureLog/{__version__} (QtWebEngine)")
         self.loadFinished.connect(self._on_load_finished)
@@ -83,10 +109,19 @@ class MapView(QWebEngineView):
     def set_media_markers(self, markers: list[dict]) -> None:
         """Show media icons, clustered when they overlap.
 
-        Each marker has ``lat``, ``lon``, ``kind`` (image|file), ``label`` and
-        ``selected``; selected markers are drawn green, above the others.
+        Each marker has ``lat``, ``lon``, ``kind`` (image|file), ``label``,
+        ``selected``, ``moved`` and ``orig``; selected markers are drawn green,
+        above the others. Moved markers are orange, with a dashed line from
+        their original position ``orig`` (``[lat, lon]`` or None).
         """
         self._run(f"setMediaMarkers({json.dumps(markers, separators=(',', ':'))})")
+
+    def _on_message(self, data: dict) -> None:
+        if data.get("type") == "move":
+            try:
+                self.moveRequested.emit(float(data["lat"]), float(data["lon"]))
+            except (KeyError, TypeError, ValueError):
+                pass
 
     def _run(self, script: str) -> None:
         if self._ready:
