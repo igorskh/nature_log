@@ -1,4 +1,4 @@
-"""Generate the Leipzig sample excursion: a GPX log, 3 photos and 2 recordings.
+"""Prepare the Leipzig sample excursion: write the GPX log, set recording times.
 
 The walk loops through Clara-Zetkin-Park, Leipzig, on 2026-05-10 from 07:00 to
 07:50 local time (Europe/Berlin, UTC+02:00). Every media file is captured
@@ -8,10 +8,10 @@ Output: ``leipzig/gps/`` holds the track, ``leipzig/media/`` the photos and
 recordings (add that folder with "Add folder…").
 
 - Photos store their capture time in EXIF ``DateTimeOriginal`` (local time,
-  no GPS tags), like a camera would.
+  no GPS tags); they are committed as they are.
 - Recordings have no capture time inside: NatureLog uses the file creation
-  time. A git checkout resets it, so run this script again after cloning to
-  set it (on macOS and Linux; on Windows use "Edit date and time…" instead).
+  time. A git checkout resets it, so run this script after cloning to set it
+  (on macOS and Linux; on Windows use "Edit date and time…" instead).
 
 Run from the project root::
 
@@ -23,12 +23,8 @@ from __future__ import annotations
 import math
 import os
 import random
-import struct
-import wave
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-
-from PIL import Image, ImageDraw
 
 OUT = Path(__file__).parent / "leipzig"
 TZ_OFFSET = timedelta(hours=2)  # CEST
@@ -48,19 +44,12 @@ ROUTE = [
     (51.32920, 12.35310),
 ]
 
-#: (file name, minutes after the start, colours, caption)
-PHOTOS = [
-    ("P5100008.jpg", 8.5, ((70, 110, 50), (160, 190, 90)), "Sample photo 1"),
-    ("P5100021.jpg", 22.25, ((40, 80, 120), (150, 190, 220)), "Sample photo 2"),
-    ("P5100037.jpg", 37.75, ((110, 80, 40), (210, 170, 110)), "Sample photo 3"),
-]
-#: (file name, minutes after the start, chirp frequencies in Hz)
+#: Recordings and their start time (minutes after the walk starts). The photos
+#: keep their capture time in EXIF, so they need no fixing after a checkout.
 RECORDINGS = [
-    ("260510_0715.wav", 15.0, (3800, 5200)),
-    ("260510_0744.wav", 44.0, (2500, 4100)),
+    ("2034488.wav", 14.0),
+    ("XC1073921.wav", 31.0),
 ]
-SAMPLE_RATE = 22050
-RECORDING_SECONDS = 6
 
 
 def _route_point(fraction: float) -> tuple[float, float]:
@@ -102,48 +91,6 @@ def write_gpx(path: Path) -> None:
     )
 
 
-def write_photo(path: Path, when: datetime, colors, caption: str) -> None:
-    width, height = 960, 640
-    image = Image.new("RGB", (width, height))
-    draw = ImageDraw.Draw(image)
-    (r1, g1, b1), (r2, g2, b2) = colors
-    for y in range(height):
-        t = y / (height - 1)
-        draw.line(
-            [(0, y), (width, y)],
-            fill=(round(r2 + (r1 - r2) * t), round(g2 + (g1 - g2) * t), round(b2 + (b1 - b2) * t)),
-        )
-    draw.text((40, 40), f"{caption}\n{when:%Y-%m-%d %H:%M:%S}", fill="white", font_size=48)
-    exif = Image.Exif()
-    exif[0x010F] = "NatureLog"  # Make
-    exif[0x0110] = "Sample camera"  # Model
-    exif_ifd = exif.get_ifd(0x8769)
-    exif_ifd[0x9003] = when.strftime("%Y:%m:%d %H:%M:%S")  # DateTimeOriginal
-    exif_ifd[0x9011] = "+02:00"  # OffsetTimeOriginal
-    image.save(path, quality=85, exif=exif)
-
-
-def write_recording(path: Path, frequencies: tuple[int, int]) -> None:
-    """Quiet background noise with a few bird-like down-chirps."""
-    rng = random.Random(path.name)
-    low, high = frequencies
-    samples = []
-    for n in range(SAMPLE_RATE * RECORDING_SECONDS):
-        t = n / SAMPLE_RATE
-        value = rng.gauss(0, 0.01)
-        phase = t % 1.2  # a 0.25 s chirp every 1.2 s
-        if phase < 0.25:
-            freq = high - (high - low) * phase / 0.25
-            envelope = math.sin(math.pi * phase / 0.25)
-            value += 0.4 * envelope * math.sin(2 * math.pi * freq * phase)
-        samples.append(max(-1.0, min(1.0, value)))
-    with wave.open(str(path), "wb") as out:
-        out.setnchannels(1)
-        out.setsampwidth(2)
-        out.setframerate(SAMPLE_RATE)
-        out.writeframes(b"".join(struct.pack("<h", round(s * 32767)) for s in samples))
-
-
 def set_file_time(path: Path, when: datetime) -> None:
     """Set the modification time; on macOS an earlier time also moves the creation time."""
     stamp = (when - TZ_OFFSET).replace(tzinfo=UTC).timestamp()
@@ -153,16 +100,14 @@ def set_file_time(path: Path, when: datetime) -> None:
 def main() -> None:
     gps, media = OUT / "gps", OUT / "media"
     gps.mkdir(parents=True, exist_ok=True)
-    media.mkdir(parents=True, exist_ok=True)
     write_gpx(gps / "20260510_clara_zetkin_park.gpx")
-    for name, minutes, colors, caption in PHOTOS:
-        write_photo(media / name, START_LOCAL + timedelta(minutes=minutes), colors, caption)
-    for name, minutes, frequencies in RECORDINGS:
+    for name, minutes in RECORDINGS:
         path = media / name
-        if not path.exists():
-            write_recording(path, frequencies)
-        set_file_time(path, START_LOCAL + timedelta(minutes=minutes))
-    print(f"Sample data written to {OUT}")
+        if path.is_file():
+            set_file_time(path, START_LOCAL + timedelta(minutes=minutes))
+        else:
+            print(f"Missing recording: {path}")
+    print(f"Sample track written and recording times set in {OUT}")
 
 
 if __name__ == "__main__":
