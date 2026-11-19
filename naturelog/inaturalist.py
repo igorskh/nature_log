@@ -113,20 +113,24 @@ def observation_hint(
     tz: tzinfo,
     tracks: Sequence[Track],
     predictions: Sequence[SpeciesPrediction] | None,
+    moved_to: tuple[float, float] | None = None,
 ) -> ObservationHint | None:
     """Suggested card values for a recording; ``None`` for other files.
 
-    The location comes from the GPS tracks at the capture time (no position
-    outside the track, never extrapolated).
+    The location is ``moved_to`` (set by the user on the map) if given, else
+    the GPS tracks at the capture time (no position outside the track, never
+    extrapolated).
     """
     if media.kind is not MediaKind.AUDIO:
         return None
     when = media.capture_time(tz)
-    position = position_on_tracks(tracks, when)
+    if moved_to is None:
+        position = position_on_tracks(tracks, when)
+        moved_to = (position.latitude, position.longitude) if position else None
     species = top_detection(predictions)
     return ObservationHint(
         observed_at=when.astimezone(tz).replace(tzinfo=None),
-        latitude=position.latitude if position else None,
-        longitude=position.longitude if position else None,
+        latitude=moved_to[0] if moved_to else None,
+        longitude=moved_to[1] if moved_to else None,
         scientific_name=species.scientific_name if species else None,
     )

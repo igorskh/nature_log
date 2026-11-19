@@ -6,7 +6,8 @@ last state when it starts again. Independent of Qt.
 Original media and GPS files are only referenced by path, never copied or
 modified. Coordinates stored with each media file are a snapshot of the
 position interpolated from the GPS logs when the session was saved; on restore
-they are recomputed from the reloaded logs.
+they are recomputed from the reloaded logs. A position the user moved a file
+to on the map is kept separately and replaces the track position.
 """
 
 from __future__ import annotations
@@ -40,6 +41,8 @@ class SessionMedia:
     position: TrackPosition | None = None
     #: Species candidates from the last detection run; ``None`` if never run.
     detections: list[SpeciesPrediction] | None = None
+    #: ``(latitude, longitude)`` the user moved the file to; replaces the track position.
+    moved_to: tuple[float, float] | None = None
 
 
 @dataclass(slots=True)
@@ -96,6 +99,7 @@ def _media_to_json(entry: SessionMedia) -> dict[str, Any]:
         "detections": None
         if entry.detections is None
         else [p.to_json() for p in entry.detections],
+        "moved_to": None if entry.moved_to is None else list(entry.moved_to),
     }
 
 
@@ -110,10 +114,12 @@ def _media_from_json(data: dict[str, Any]) -> SessionMedia:
         exif_coordinates=None if coords is None else (float(coords[0]), float(coords[1])),
     )
     detections = data.get("detections")
+    moved = data.get("moved_to")
     return SessionMedia(
         media,
         _position_from_json(data.get("position")),
         None if detections is None else [SpeciesPrediction.from_json(d) for d in detections],
+        None if moved is None else (float(moved[0]), float(moved[1])),
     )
 
 

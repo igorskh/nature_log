@@ -74,14 +74,17 @@ _THUMB_SIZE = 2 * _ICON_SIZE  # sharp on high-DPI screens
 _ROLE_MEDIA = Qt.ItemDataRole.UserRole
 #: list[SpeciesPrediction] from the last detection run, or None if never run.
 _ROLE_DETECTIONS = Qt.ItemDataRole.UserRole + 1
-#: (stored in file, position from tracks) GPS flags of a listed file.
+#: (stored in file, position from tracks, moved on the map) GPS flags of a listed file.
 _ROLE_GPS = Qt.ItemDataRole.UserRole + 2
+#: ``(latitude, longitude)`` the user moved the file to on the map, or None.
+_ROLE_MOVED = Qt.ItemDataRole.UserRole + 3
 _BADGE_SIZE = 20
 _BADGE_COLOR = QColor(46, 139, 87)
 _GLOBE_SIZE = 18
-#: Globe colours: coordinates stored in the file / interpolated from loaded tracks.
+#: Globe colours: coordinates stored in the file / from loaded tracks / moved on the map.
 _GLOBE_STORED = QColor(47, 158, 68)
 _GLOBE_TRACK = QColor(25, 113, 194)
+_GLOBE_MOVED = QColor(232, 89, 12)
 _COPY_TIME_FORMAT = "%Y/%m/%d %H:%M"
 
 
@@ -219,14 +222,15 @@ class _DetectionBadgeDelegate(QStyledItemDelegate):
     """Draws badges on previews: species detected, and where GPS coordinates come from.
 
     A green globe means the file stores GPS coordinates in its EXIF; a blue
-    globe means a position is interpolated from the loaded tracks.
+    globe means a position is interpolated from the loaded tracks; an orange
+    globe means the user moved the file to another position on the map.
     """
 
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
         super().paint(painter, option, index)
-        stored, on_track = index.data(_ROLE_GPS) or (False, False)
+        stored, on_track, moved = index.data(_ROLE_GPS) or (False, False, False)
         detected_species = top_detection(index.data(_ROLE_DETECTIONS)) is not None
-        if not (stored or on_track or detected_species):
+        if not (stored or on_track or moved or detected_species):
             return
         opt = QStyleOptionViewItem(option)
         self.initStyleOption(opt, index)
@@ -234,9 +238,11 @@ class _DetectionBadgeDelegate(QStyledItemDelegate):
         icon_rect = style.subElementRect(
             QStyle.SubElement.SE_ItemViewItemDecoration, opt, opt.widget
         )
-        # Globes along the top edge, from the right: stored (green), then track (blue).
+        # Globes along the top edge, from the right: stored (green), then track
+        # (blue) or moved (orange).
         x = icon_rect.right() - _GLOBE_SIZE + 3
-        for show, color in ((stored, _GLOBE_STORED), (on_track, _GLOBE_TRACK)):
+        globes = ((stored, _GLOBE_STORED), (on_track, _GLOBE_TRACK), (moved, _GLOBE_MOVED))
+        for show, color in globes:
             if show:
                 _paint_globe(
                     painter, QRectF(x, icon_rect.top() - 3, _GLOBE_SIZE, _GLOBE_SIZE), color
@@ -329,6 +335,8 @@ class MediaSidebar(QWidget):
     iconChanged = Signal(object)
     #: Emitted when species detections of files changed.
     detectionsChanged = Signal()
+    #: Emitted when files were moved to (or reset from) a position chosen on the map.
+    positionsChanged = Signal()
     #: User asked to detect species in these :class:`MediaFile` photos/recordings.
     detectRequested = Signal(list)
     #: User asked to upload these selected :class:`MediaFile` objects to iNaturalist.
@@ -402,6 +410,9 @@ class MediaSidebar(QWidget):
         self._write_coords_action = self._list_action(
             "Write coordinates to files…", QKeySequence(), self.write_coordinates
         )
+        self._reset_position_action = self._list_action(
+            "Reset moved position", QKeySequence(), self.reset_selected_positions
+        )
         self._list.setContextMenuPolicy(Qt.ContextMenuPolicy.ActionsContextMenu)
 
         self._remove_button = QPushButton("Remove")
@@ -413,7 +424,8 @@ class MediaSidebar(QWidget):
 
         self._write_coords_button = QPushButton("Write coordinates")
         self._write_coords_button.setToolTip(
-            "Write GPS coordinates from the track into the EXIF of the selected photos "
+            "Write GPS coordinates (from the track, or where they were moved on the map) "
+            "into the EXIF of the selected photos "
             "(a backup of each original is kept as <name>_original)"
         )
         self._write_coords_button.clicked.connect(self.write_coordinates)
@@ -493,6 +505,70 @@ class MediaSidebar(QWidget):
         if changed:
             self.detectionsChanged.emit()
 
+    def track_position_of(self, media: MediaFile) -> TrackPosition | None:
+        """Position on the loaded tracks at the file's capture time, if any."""
+        return position_on_tracks(self._tracks, media.capture_time(self._tz))
+
+    def moved_position(self, media: MediaFile) -> tuple[float, float] | None:
+        """``(latitude, longitude)`` the file was moved to on the map, if any."""
+        item = self._items.get(media.path)
+        return None if item is None else item.data(_ROLE_MOVED)
+
+    def moved_positions(self) -> dict[Path, tuple[float, float]]:
+        return {
+            path: moved
+            for path, item in self._items.items()
+            if (moved := item.data(_ROLE_MOVED)) is not None
+        }
+
+    def position_of(self, media: MediaFile) -> TrackPosition | None:
+        """The file's position: where it was moved on the map, else on the tracks."""
+        moved = self.moved_position(media)
+        if moved is None:
+            return self.track_position_of(media)
+        return TrackPosition(
+            time=media.capture_time(self._tz),
+            latitude=moved[0],
+            longitude=moved[1],
+            elevation=None,
+            interpolated=False,
+        )
+
+    def set_moved_positions(self, positions: dict[Path, tuple[float, float] | None]) -> None:
+        """Move listed files to positions chosen on the map (``None`` resets to the track)."""
+        changed = False
+        for path, moved in positions.items():
+            item = self._items.get(path)
+            if item is None or item.data(_ROLE_MOVED) == moved:
+                continue
+            item.setData(_ROLE_MOVED, moved)
+            self._apply_text(item, item.data(_ROLE_MEDIA))
+            changed = True
+        if changed:
+            self._update_count()
+            self.positionsChanged.emit()
+
+    def move_selected_to(self, latitude: float, longitude: float) -> None:
+        """Move the selected files to this position (they keep their track position too)."""
+        files = self.selected_files()
+        if not files:
+            self.message.emit("Select files in the list to move them on the map")
+            return
+        self.set_moved_positions({m.path: (latitude, longitude) for m in files})
+        self.message.emit(
+            f"Moved {len(files)} file{'s' if len(files) != 1 else ''} to "
+            f"{latitude:.6f}, {longitude:.6f}"
+        )
+
+    def reset_selected_positions(self) -> None:
+        """Return the selected files to their position on the tracks."""
+        moved = [m for m in self.selected_files() if self.moved_position(m) is not None]
+        self.set_moved_positions({m.path: None for m in moved})
+        if moved:
+            self.message.emit(
+                f"Reset position of {len(moved)} file{'s' if len(moved) != 1 else ''}"
+            )
+
     def select_all(self) -> None:
         self._list.selectAll()
 
@@ -548,17 +624,15 @@ class MediaSidebar(QWidget):
     def copy_coordinates(self) -> None:
         """Copy ``lat, lon`` of the selected files, one line per file.
 
-        Files outside the track or in a gap have no position and are skipped.
+        Moved files give the position chosen on the map. Files outside the
+        track or in a gap have no position and are skipped.
         """
         files = self.selected_files()
         if not files:
             return
-        if not self._tracks:
-            self.message.emit("Load a GPS log to get coordinates")
-            return
         lines = []
         for media in files:
-            position = position_on_tracks(self._tracks, media.capture_time(self._tz))
+            position = self.position_of(media)
             if position is not None:
                 lines.append(f"{position.latitude:.6f}, {position.longitude:.6f}")
         missing = len(files) - len(lines)
@@ -572,16 +646,14 @@ class MediaSidebar(QWidget):
         self.message.emit(text)
 
     def write_coordinates(self) -> None:
-        """Write track coordinates into the EXIF GPS tags of the selected photos.
+        """Write coordinates into the EXIF GPS tags of the selected photos.
 
-        Only EXIF-capable formats with a position on the track are written;
-        files outside the track or in a gap are skipped (no extrapolation).
+        Moved files get the position chosen on the map, the others their track
+        position. Only EXIF-capable formats with a position are written; files
+        outside the track or in a gap are skipped (no extrapolation).
         """
         files = self.selected_files()
         if not files or self._geotag_running():
-            return
-        if not self._tracks:
-            self.message.emit("Load a GPS log to get coordinates")
             return
         if exiftool_path() is None:
             QMessageBox.warning(
@@ -591,7 +663,7 @@ class MediaSidebar(QWidget):
         compatible = [m for m in files if can_geotag(m)]
         items = []
         for media in compatible:
-            position = position_on_tracks(self._tracks, media.capture_time(self._tz))
+            position = self.position_of(media)
             if position is not None:
                 items.append((media, position))
         notes = []
@@ -936,11 +1008,15 @@ class MediaSidebar(QWidget):
         lines = [media.name, stamp, source]
         tooltip = [str(media.path)]
         stored = media.exif_coordinates is not None and has_exif(media.path)
-        track_position = position_on_tracks(self._tracks, media.capture_time(self._tz))
-        item.setData(_ROLE_GPS, (stored, track_position is not None))
+        track_position = self.track_position_of(media)
+        moved = item.data(_ROLE_MOVED)
+        on_track = track_position is not None and moved is None
+        item.setData(_ROLE_GPS, (stored, on_track, moved is not None))
         if stored:
             lat, lon = media.exif_coordinates
             tooltip.append(f"GPS stored in file: {lat:.6f}, {lon:.6f}")
+        if moved is not None:
+            tooltip.append(f"Moved on the map to: {moved[0]:.6f}, {moved[1]:.6f}")
         if track_position is not None:
             how = "interpolated" if track_position.interpolated else "recorded fix"
             tooltip.append(
@@ -993,11 +1069,17 @@ class MediaSidebar(QWidget):
         self._remove_button.setEnabled(selected > 0)
         self._remove_action.setEnabled(selected > 0)
         self._clear_selection_action.setEnabled(selected > 0)
-        self._copy_coords_action.setEnabled(selected > 0 and bool(self._tracks))
+        has_positions = bool(self._tracks) or any(
+            item.data(_ROLE_MOVED) is not None for item in self._items.values()
+        )
+        self._copy_coords_action.setEnabled(selected > 0 and has_positions)
         self._copy_time_action.setEnabled(selected > 0)
         self._edit_time_action.setEnabled(selected > 0 and not self._edit_running())
         self._detect_action.setEnabled(selected > 0)
-        can_write = selected > 0 and bool(self._tracks) and not self._geotag_running()
+        can_write = selected > 0 and has_positions and not self._geotag_running()
+        self._reset_position_action.setEnabled(
+            any(item.data(_ROLE_MOVED) is not None for item in self._list.selectedItems())
+        )
         self._write_coords_action.setEnabled(can_write)
         self._write_coords_button.setEnabled(can_write)
         self._select_all_action.setEnabled(count > 0)

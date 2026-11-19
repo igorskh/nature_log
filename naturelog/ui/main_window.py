@@ -201,6 +201,9 @@ class MainWindow(QMainWindow):
         self._preview: PreviewWindow | None = None
         self._media.previewRequested.connect(self._show_preview)
         self._media.detectionsChanged.connect(self._refresh_preview_species)
+        self._map.moveRequested.connect(self._media.move_selected_to)
+        self._media.positionsChanged.connect(self._refresh_map_markers)
+        self._media.positionsChanged.connect(self._schedule_save)
 
         self._track_panel = TrackSidebar()
         self._track_panel.addRequested.connect(self._choose_file)
@@ -418,32 +421,42 @@ class MainWindow(QMainWindow):
         self._show_media_on_track(self._media.selected_files(), report=False)
 
     def _show_media_on_track(self, files: list[MediaFile], report: bool = True) -> None:
-        """Place every listed file on the tracks at its interpolated capture position.
+        """Place every listed file on the map at its position.
 
-        ``files`` are the selected ones: they are drawn green, above the others.
-        EXIF capture times are read in the selected timezone.
+        That is where the user moved it, else its interpolated capture position
+        on the tracks. ``files`` are the selected ones: they are drawn green,
+        above the others. EXIF capture times are read in the selected timezone.
         Files outside the track or in a gap get no marker (no extrapolation).
         """
         selected = {media.path for media in files}
         markers = []
         outside = 0
-        for media in self._media.media_files() if self._tracks else []:
+        for media in self._media.media_files():
             when = media.capture_time(self._tz)
-            position = position_on_tracks(self._tracks, when)
-            if position is None:
-                outside += media.path in selected
+            track_position = self._media.track_position_of(media)
+            moved = self._media.moved_position(media)
+            if moved is None and track_position is None:
+                outside += media.path in selected and bool(self._tracks)
                 continue
+            lat, lon = moved or (track_position.latitude, track_position.longitude)
+            label = f"{media.name}\n{format_datetime(when, self._tz)}"
+            if moved is not None:
+                label += "\nmoved on the map"
             markers.append({
-                "lat": position.latitude,
-                "lon": position.longitude,
+                "lat": lat,
+                "lon": lon,
                 "kind": "image" if media.kind.is_image else "file",
-                "label": f"{media.name}\n{format_datetime(when, self._tz)}",
+                "label": label,
                 "selected": media.path in selected,
+                "moved": moved is not None,
+                "orig": None
+                if moved is None or track_position is None
+                else [track_position.latitude, track_position.longitude],
             })  # fmt: skip
         self._map.set_media_markers(markers)
         if not report:
             return
-        if not self._tracks and files:
+        if not self._tracks and files and not any(m["selected"] for m in markers):
             self.statusBar().showMessage("Load a GPS log to place media on the track")
         elif outside:
             self.statusBar().showMessage(
@@ -482,7 +495,11 @@ class MainWindow(QMainWindow):
     def _observation_hint(self, media: MediaFile) -> ObservationHint | None:
         """Date, track position and top species to fill in a recording's iNaturalist card."""
         return observation_hint(
-            media, self._tz, self._tracks, self._media.detections_for(media)
+            media,
+            self._tz,
+            self._tracks,
+            self._media.detections_for(media),
+            self._media.moved_position(media),
         )
 
     def _show_preview(self, media: MediaFile) -> None:
@@ -549,8 +566,9 @@ class MainWindow(QMainWindow):
         media = [
             SessionMedia(
                 m,
-                position_on_tracks(self._tracks, m.capture_time(self._tz)),
+                self._media.position_of(m),
                 self._media.detections_for(m),
+                self._media.moved_position(m),
             )
             for m in self._media.media_files()
         ]
@@ -588,6 +606,11 @@ class MainWindow(QMainWindow):
             entry.media.path: entry.detections
             for entry in session.media
             if entry.detections is not None
+        })  # fmt: skip
+        self._media.set_moved_positions({
+            entry.media.path: entry.moved_to
+            for entry in session.media
+            if entry.moved_to is not None
         })  # fmt: skip
 
         notes = []

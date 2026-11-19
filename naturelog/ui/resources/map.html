@@ -19,6 +19,14 @@
   .media-icon { color: #1971c2; }
   .media-icon.file { border-color: #5c636a; color: #5c636a; }
   .media-icon.selected { border-color: #2f9e44; color: #2f9e44; background: #ebfbee; border-width: 3px; }
+  /* Files moved by the user to a new position. */
+  .media-icon.moved { border-color: #e8590c; color: #e8590c; }
+  .media-icon.moved.selected { background: #fff4e6; }
+  .move-tool a { display: flex !important; align-items: center; justify-content: center; color: #333; }
+  .move-tool a svg { width: 18px; height: 18px; }
+  .move-tool a.active { background: #e8590c; color: #fff; }
+  .move-tool a.active:hover { background: #d9480f; }
+  #map.moving, #map.moving .leaflet-interactive { cursor: crosshair; }
   .media-icon svg { width: 18px; height: 18px; }
   .media-cluster {
     width: 34px; height: 34px; box-sizing: border-box; border-radius: 50%;
@@ -48,7 +56,43 @@
 
   let trackLayer = null;
   let marker = null;
+  // Original positions of moved files and dashed lines to where they were moved.
+  const moveLayer = L.layerGroup().addTo(map);
   const mediaLayer = L.layerGroup().addTo(map);
+  const MOVED_COLOR = '#e8590c';
+
+  // Messages to the application are passed as console lines with this prefix.
+  function notify(message) { console.log('naturelog:' + JSON.stringify(message)); }
+
+  // Map tool: while active, a click moves the selected files to that point.
+  let moveMode = false;
+  let moveButton = null;
+  function setMoveMode(on) {
+    moveMode = on;
+    map.getContainer().classList.toggle('moving', on);
+    if (moveButton) { moveButton.classList.toggle('active', on); }
+  }
+  const MoveTool = L.Control.extend({
+    options: { position: 'topleft' },
+    onAdd() {
+      const bar = L.DomUtil.create('div', 'leaflet-bar move-tool');
+      moveButton = L.DomUtil.create('a', '', bar);
+      moveButton.href = '#';
+      moveButton.title = 'Move selected files: click the map where they were observed (Esc to stop)';
+      moveButton.setAttribute('role', 'button');
+      moveButton.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" ' +
+        'stroke-linecap="round" stroke-linejoin="round"><path d="M12 21s-6-5.6-6-11a6 6 0 0 1 12 0c0 5.4-6 11-6 11z"/>' +
+        '<circle cx="12" cy="10" r="2"/></svg>';
+      L.DomEvent.disableClickPropagation(bar);
+      L.DomEvent.on(moveButton, 'click', e => { L.DomEvent.preventDefault(e); setMoveMode(!moveMode); });
+      return bar;
+    }
+  });
+  map.addControl(new MoveTool());
+  map.on('click', e => {
+    if (moveMode) { notify({ type: 'move', lat: e.latlng.lat, lon: e.latlng.lng }); }
+  });
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') { setMoveMode(false); } });
 
   const GLYPHS = {
     image: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" ' +
@@ -58,11 +102,12 @@
       'stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 ' +
       '2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>'
   };
-  function mediaIcon(kind, selected) {
+  function mediaIcon(kind, selected, moved) {
     const glyph = GLYPHS[kind] ? kind : 'file';
+    const classes = `media-icon ${glyph}${selected ? ' selected' : ''}${moved ? ' moved' : ''}`;
     return L.divIcon({
       className: '', iconSize: [28, 28], iconAnchor: [14, 14], tooltipAnchor: [14, 0],
-      html: `<div class="media-icon ${glyph}${selected ? ' selected' : ''}">${GLYPHS[glyph]}</div>`
+      html: `<div class="${classes}">${GLYPHS[glyph]}</div>`
     });
   }
   function clusterIcon(count, selected) {
@@ -109,14 +154,31 @@
     return clusters;
   }
 
+  // Moved files: the original (track) position as a hollow dot, a dashed line to the new one.
+  function drawMoves() {
+    moveLayer.clearLayers();
+    for (const item of mediaItems) {
+      if (!item.moved || !item.orig) { continue; }
+      const name = escapeHtml(item.label.split('\n')[0]);
+      L.polyline([item.orig, [item.lat, item.lon]], {
+        color: MOVED_COLOR, weight: item.selected ? 3 : 2, opacity: item.selected ? 0.95 : 0.7,
+        dashArray: '6 6', interactive: false
+      }).addTo(moveLayer);
+      L.circleMarker(item.orig, {
+        radius: 6, weight: 2, color: '#495057', fillColor: '#fff', fillOpacity: 0.9
+      }).bindTooltip(`${name} – original position`).addTo(moveLayer);
+    }
+  }
+
   function drawMediaMarkers() {
     mediaLayer.clearLayers();
+    drawMoves();
     for (const selected of [false, true]) {
       const zIndexOffset = selected ? 2000 : 1000;
       for (const c of cluster(mediaItems.filter(item => !!item.selected === selected))) {
         if (c.items.length === 1) {
           const item = c.items[0];
-          L.marker([item.lat, item.lon], { icon: mediaIcon(item.kind, selected), zIndexOffset })
+          L.marker([item.lat, item.lon], { icon: mediaIcon(item.kind, selected, item.moved), zIndexOffset })
             .bindTooltip(escapeHtml(item.label).replace(/\n/g, '<br>'))
             .addTo(mediaLayer);
           continue;
@@ -140,7 +202,7 @@
   }
   map.on('zoomend', drawMediaMarkers);
 
-  // items: [{lat, lon, kind: 'image' | 'file', label, selected}, ...]
+  // items: [{lat, lon, kind: 'image' | 'file', label, selected, moved, orig: [lat, lon] | null}, ...]
   function setMediaMarkers(items) {
     mediaItems = items;
     drawMediaMarkers();
@@ -202,6 +264,7 @@
     clearPosition();
     mediaItems = [];
     mediaLayer.clearLayers();
+    moveLayer.clearLayers();
     document.getElementById('hint').style.display = '';
   }
 
