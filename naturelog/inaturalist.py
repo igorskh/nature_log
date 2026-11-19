@@ -82,30 +82,40 @@ def upload_selection(media: Iterable[MediaFile]) -> UploadSelection:
 
 @dataclass(frozen=True, slots=True)
 class ObservationHint:
-    """Values NatureLog suggests for the uploader card of a recording.
+    """Values NatureLog suggests for the uploader card of a file.
 
     iNaturalist reads date and location from photo EXIF itself, but not from
-    sounds, so these are filled in for recordings.
+    sounds, so date, location and species are filled in for recordings. For
+    photos only the location is given: the session position replaces the one
+    iNaturalist read from EXIF.
     """
 
     #: Wall-clock capture time in the session timezone (iNaturalist takes the
-    #: date without offset, like the EXIF time of photos).
-    observed_at: datetime
+    #: date without offset, like the EXIF time of photos). ``None`` keeps the
+    #: card's date.
+    observed_at: datetime | None = None
     latitude: float | None = None
     longitude: float | None = None
     #: Most probable detected species, looked up by name on iNaturalist.
     scientific_name: str | None = None
+    #: Replace a location the card already has (photo EXIF) instead of only
+    #: filling an empty one.
+    replace_location: bool = False
 
     def to_json(self) -> dict[str, Any]:
         when = self.observed_at
         return {
-            "date": f"{when.year:04d}/{when.month:02d}/{when.day:02d}",
-            "hour": when.hour,
-            "minute": when.minute,
+            "date": f"{when.year:04d}/{when.month:02d}/{when.day:02d}" if when else None,
+            "hour": when.hour if when else None,
+            "minute": when.minute if when else None,
             "latitude": self.latitude,
             "longitude": self.longitude,
             "scientificName": self.scientific_name,
+            "replaceLocation": self.replace_location,
         }
+
+
+_PHOTO_KINDS = frozenset({MediaKind.JPEG, MediaKind.RAW, MediaKind.IMAGE})
 
 
 def observation_hint(
@@ -115,18 +125,24 @@ def observation_hint(
     predictions: Sequence[SpeciesPrediction] | None,
     moved_to: tuple[float, float] | None = None,
 ) -> ObservationHint | None:
-    """Suggested card values for a recording; ``None`` for other files.
+    """Suggested card values for a recording or photo; ``None`` for other files.
 
     The location is ``moved_to`` (set by the user on the map) if given, else
     the GPS tracks at the capture time (no position outside the track, never
-    extrapolated).
+    extrapolated). Photos get only this session location, which is preferred
+    over their EXIF location; without one (``None``) their EXIF stays.
     """
-    if media.kind is not MediaKind.AUDIO:
+    is_photo = media.kind in _PHOTO_KINDS
+    if media.kind is not MediaKind.AUDIO and not is_photo:
         return None
     when = media.capture_time(tz)
     if moved_to is None:
         position = position_on_tracks(tracks, when)
         moved_to = (position.latitude, position.longitude) if position else None
+    if is_photo:
+        if moved_to is None:
+            return None
+        return ObservationHint(latitude=moved_to[0], longitude=moved_to[1], replace_location=True)
     species = top_detection(predictions)
     return ObservationHint(
         observed_at=when.astimezone(tz).replace(tzinfo=None),

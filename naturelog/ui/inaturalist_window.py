@@ -4,8 +4,10 @@ The user signs in on iNaturalist in the embedded browser (the login is kept in
 a persistent, app-private browser profile). "Add selected files" opens the
 iNaturalist uploader and hands the selected files to it, as if they had been
 chosen in its file dialog. iNaturalist reads date and location of photos from
-their EXIF; for recordings NatureLog fills the date, the track position and the
-most probable detected species into their observation cards (empty fields only).
+their EXIF; NatureLog replaces that location with the session one (moved on the
+map or interpolated on the GPS tracks) when there is one. For recordings it
+fills the date, the track position and the most probable detected species into
+their observation cards (empty fields only).
 Reviewing and submitting observations stays on iNaturalist. Files are only
 read, never changed.
 
@@ -65,8 +67,9 @@ _FILL_POLL_TRIES = 60
 _JS_FILL_SET = "window.__naturelogFill = {pending: %(hints)s, filled: 0};"
 
 #: Fill date, location and species into the uploader cards of the pending
-#: recordings, through the card's own ``updateObsCard`` (as if typed by the
-#: user). Only empty fields are set. Returns the number of cards not found yet.
+#: files, through the card's own ``updateObsCard`` (as if typed by the user).
+#: Only empty fields are set, except the location of hints with
+#: ``replaceLocation`` (photos). Returns the number of cards not done yet.
 _JS_FILL = """
 (() => {
   const S = window.__naturelogFill;
@@ -118,18 +121,32 @@ _JS_FILL = """
       })
       .catch(() => {});
   };
+  const near = (a, b) => a != null && Math.abs(Number(a) - b) < 1e-7;
   S.pending = S.pending.filter(h => {
     const p = findCard(h.key);
     if (!p) return true;
     const card = p.obsCard;
     const attrs = {};
-    if (!card.date) attrs.date = attrs.selected_date = dateText(h);
-    if (h.latitude != null && h.longitude != null && card.latitude == null) {
+    if (h.date && !card.date) attrs.date = attrs.selected_date = dateText(h);
+    const hasLocation = h.latitude != null && h.longitude != null;
+    if (hasLocation && h.replaceLocation) {
+      // The session location wins over the photo's EXIF one. EXIF is read
+      // asynchronously and may arrive later, so keep checking until the card
+      // has held our location for a few polls.
+      if (near(card.latitude, h.latitude) && near(card.longitude, h.longitude)) {
+        h.stable = (h.stable || 0) + 1;
+      } else {
+        h.stable = 0;
+        attrs.latitude = h.latitude;
+        attrs.longitude = h.longitude;
+      }
+    } else if (hasLocation && card.latitude == null) {
       attrs.latitude = h.latitude;
       attrs.longitude = h.longitude;
     }
     if (Object.keys(attrs).length) p.updateObsCard(card, attrs);
     if (h.scientificName && !card.taxon_id && !card.species_guess) setTaxon(h.key, h.scientificName);
+    if (h.replaceLocation && hasLocation && (h.stable || 0) < 3) return true;
     S.filled += 1;
     return false;
   });
@@ -256,7 +273,7 @@ class InaturalistWindow(QWidget):
         parent: QWidget | None = None,
         hint_source: Callable[[MediaFile], ObservationHint | None] | None = None,
     ) -> None:
-        """``hint_source`` gives the card values to fill for a file (recordings)."""
+        """``hint_source`` gives the card values to fill for a file (recordings, photos)."""
         super().__init__(parent, Qt.WindowType.Window)
         self.setWindowTitle("Upload to iNaturalist")
         self.resize(1200, 860)
@@ -440,7 +457,7 @@ class InaturalistWindow(QWidget):
         self._status(text + _skipped_note(self._failed))
         self._update_button()
 
-    # --- filling recording cards ----------------------------------------
+    # --- filling observation cards ----------------------------------------
 
     def _start_fill(self) -> None:
         script = _JS_FILL_SET % {"hints": json.dumps(self._fill)}
@@ -459,16 +476,16 @@ class InaturalistWindow(QWidget):
         if isinstance(remaining, (int, float)) and remaining <= 0:
             self._fill = []
             self._status(
-                f"Filled date, location and species of {total} recording(s) – "
+                f"Filled date, location or species of {total} observation card(s) – "
                 "check them before submitting"
             )
         elif self._fill_tries >= _FILL_POLL_TRIES:
             self._fill = []
             if isinstance(remaining, (int, float)):
                 done = total - int(remaining)
-                self._status(f"Filled {done} of {total} recording card(s); fill the rest by hand")
+                self._status(f"Filled {done} of {total} observation card(s); fill the rest by hand")
             else:
-                self._status("Could not fill the recording cards; fill them by hand")
+                self._status("Could not fill the observation cards; fill them by hand")
         else:
             self._fill_timer.start()
 

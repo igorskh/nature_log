@@ -493,7 +493,7 @@ class MainWindow(QMainWindow):
         self._inaturalist.activateWindow()
 
     def _observation_hint(self, media: MediaFile) -> ObservationHint | None:
-        """Date, track position and top species to fill in a recording's iNaturalist card."""
+        """iNaturalist card values: session location, plus date and top species for recordings."""
         return observation_hint(
             media,
             self._tz,
