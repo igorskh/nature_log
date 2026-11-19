@@ -29,7 +29,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from naturelog.media import MediaFile
+from naturelog.media import MediaFile, MediaKind
+from naturelog.media.crops import AudioCrop, Crop, ImageCrop
 from naturelog.species import (
     DetectionConfig,
     DetectorUnavailable,
@@ -87,7 +88,7 @@ class _StickerTask(QRunnable):
 
 class _DetectSignals(QObject):
     loaded = Signal()  # model ready, classification starts
-    detected = Signal(object, object)  # Path, list[SpeciesPrediction] | None
+    detected = Signal(object, object, object)  # Path, Crop | None, list[SpeciesPrediction] | None
     progress = Signal(int, int)
     failed = Signal(str)
     finished = Signal()
@@ -97,24 +98,38 @@ class _DetectTask(QRunnable):
     """Classifies photos and recordings off the UI thread, emitting each result as it is ready."""
 
     def __init__(
-        self, detector: SpeciesDetector, files: list[MediaFile], config: DetectionConfig
+        self,
+        detector: SpeciesDetector,
+        files: list[MediaFile],
+        config: DetectionConfig,
+        crops: dict[Path, list[Crop]],
     ) -> None:
         super().__init__()
         self.detector = detector
         self.files = files
         self.config = config
+        self.crops = crops
+        #: Results expected: one per file and one per crop of a matching kind.
+        self.total = len(files) + sum(
+            isinstance(c, AudioCrop if m.kind is MediaKind.AUDIO else ImageCrop)
+            for m in files
+            for c in crops.get(m.path, ())
+        )
         self.signals = _DetectSignals()
         self.cancelled = threading.Event()
 
     def run(self) -> None:
-        total = len(self.files)
         try:
             results = self.detector.detect(
-                self.files, self.config, cancelled=self.cancelled, on_loaded=self.signals.loaded.emit
+                self.files,
+                self.config,
+                cancelled=self.cancelled,
+                on_loaded=self.signals.loaded.emit,
+                crops=self.crops,
             )
-            for done, (media, predictions) in enumerate(results, 1):
-                self.signals.detected.emit(media.path, predictions)
-                self.signals.progress.emit(done, total)
+            for done, (media, crop, predictions) in enumerate(results, 1):
+                self.signals.detected.emit(media.path, crop, predictions)
+                self.signals.progress.emit(done, self.total)
         except DetectorUnavailable as exc:
             self.signals.failed.emit(str(exc))
         except Exception as exc:  # report instead of dying silently in a worker
@@ -128,6 +143,8 @@ class SpeciesPanel(QWidget):
 
     #: Results of a detection run: ``{path: predictions or None}`` (one per file).
     detected = Signal(object)  # dict[Path, ...]: Signal(dict) would need str keys
+    #: Result for one crop of a file: path, crop, predictions or None.
+    cropDetected = Signal(object, object, object)
     #: User asked to run detection (main window decides which photos).
     detectRequested = Signal()
     #: User picked a species; carries the paths of the files it was detected in.
@@ -221,8 +238,9 @@ class SpeciesPanel(QWidget):
         self._detections = detections
         self._refresh()
 
-    def detect(self, files: list[MediaFile]) -> None:
-        """Run species detection on these photos and recordings in the background."""
+    def detect(self, files: list[MediaFile], crops: dict[Path, list[Crop]] | None = None) -> None:
+        """Run species detection on these photos and recordings, and on their
+        ``crops``, in the background."""
         supported = [m for m in files if can_detect(m)]
         if self._task is not None:
             self.message.emit("Species detection is already running")
@@ -230,9 +248,11 @@ class SpeciesPanel(QWidget):
         if not supported:
             self.message.emit("No photos or recordings to detect species in")
             return
-        task = _DetectTask(self._detector, supported, self._config)
+        task = _DetectTask(self._detector, supported, self._config, crops or {})
         task.signals.loaded.connect(lambda: self._on_loaded(task))
-        task.signals.detected.connect(lambda path, preds: self._on_detected(task, path, preds))
+        task.signals.detected.connect(
+            lambda path, crop, preds: self._on_detected(task, path, crop, preds)
+        )
         task.signals.progress.connect(lambda done, total: self._on_progress(task, done, total))
         task.signals.failed.connect(lambda text: self._on_failed(task, text))
         task.signals.finished.connect(lambda: self._on_finished(task))
@@ -242,7 +262,9 @@ class SpeciesPanel(QWidget):
         self._progress_bar.setRange(0, 0)
         self._progress_bar.setFormat("Loading model…")
         self._progress_bar.show()
-        self.message.emit(f"Detecting species in {len(supported)} file(s)…")
+        cropped = task.total - len(supported)
+        extra = f" and {cropped} crop{'s' if cropped != 1 else ''}" if cropped else ""
+        self.message.emit(f"Detecting species in {len(supported)} file(s){extra}…")
         QThreadPool.globalInstance().start(task)
 
     def cancel(self) -> None:
@@ -286,13 +308,17 @@ class SpeciesPanel(QWidget):
         if task is self._task:
             # Called once per model (photos, then recordings); progress keeps counting.
             if self._progress_bar.maximum() == 0:
-                self._progress_bar.setRange(0, len(task.files))
+                self._progress_bar.setRange(0, task.total)
                 self._progress_bar.setValue(0)
             self._progress_bar.setFormat("Detecting species %v / %m")
 
-    def _on_detected(self, task: _DetectTask, path: Path, predictions) -> None:
-        if task is self._task:
+    def _on_detected(self, task: _DetectTask, path: Path, crop: Crop | None, predictions) -> None:
+        if task is not self._task:
+            return
+        if crop is None:
             self.detected.emit({path: predictions})
+        else:
+            self.cropDetected.emit(path, crop, predictions)
 
     def _on_progress(self, task: _DetectTask, done: int, total: int) -> None:
         if task is self._task:

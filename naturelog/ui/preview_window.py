@@ -1,16 +1,48 @@
-"""Window previewing one media file: the image or an audio player, its metadata and species."""
+"""Window previewing one media file: the image or an audio player, its crops,
+metadata and species."""
 
 from __future__ import annotations
 
 from datetime import tzinfo
 
-from PySide6.QtCore import QObject, QRunnable, QSize, Qt, QThreadPool, QTimer, QUrl, Signal
-from PySide6.QtGui import QCloseEvent, QImage, QKeySequence, QPixmap, QResizeEvent, QShortcut
+from PySide6.QtCore import (
+    QEvent,
+    QObject,
+    QPointF,
+    QRect,
+    QRectF,
+    QRunnable,
+    QSize,
+    QSizeF,
+    Qt,
+    QThreadPool,
+    QTimer,
+    QUrl,
+    Signal,
+)
+from PySide6.QtGui import (
+    QCloseEvent,
+    QColor,
+    QIcon,
+    QImage,
+    QInputDevice,
+    QKeySequence,
+    QMouseEvent,
+    QPainter,
+    QPaintEvent,
+    QPen,
+    QPixmap,
+    QResizeEvent,
+    QShortcut,
+    QWheelEvent,
+)
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QListView,
     QListWidget,
     QListWidgetItem,
     QPushButton,
@@ -25,11 +57,19 @@ from PySide6.QtWidgets import (
 )
 
 from naturelog.media import MediaFile, MediaKind, TimeSource, make_thumbnail
+from naturelog.media.crops import AudioCrop, Crop, ImageCrop, make_audio_crop, make_image_crop
 from naturelog.media.exif_details import MetadataEntry, read_metadata
 from naturelog.media.spectrogram import SpectrogramError, compute_mel_spectrogram
 from naturelog.species import SpeciesPrediction, detected
 from naturelog.timezones import format_datetime
-from naturelog.ui.spectrogram_view import SpectrogramView, spectrogram_image
+from naturelog.ui.spectrogram_view import (
+    CROP_FILL,
+    CROP_OUTLINE,
+    CROP_SELECTED_FILL,
+    CROP_SELECTED_OUTLINE,
+    SpectrogramView,
+    spectrogram_image,
+)
 
 #: Longest side of the decoded preview image, px.
 _PREVIEW_SIZE = 2400
@@ -38,6 +78,8 @@ _TOP_SPECIES = 10
 _ROLE_START = Qt.ItemDataRole.UserRole
 #: Playback line refresh while playing, ms.
 _PLAYHEAD_INTERVAL = 33
+#: Size of crop thumbnails in the crop strip, px.
+_CROP_ICON = QSize(120, 80)
 
 
 def _clock(ms: int) -> str:
@@ -96,44 +138,303 @@ class _SpectrogramTask(QRunnable):
 # --- widgets --------------------------------------------------------------
 
 
-class _ImageView(QLabel):
-    """Shows an image scaled to fit, keeping its aspect ratio."""
+class _ImageView(QWidget):
+    """Shows an image fitted to the widget, keeping its aspect ratio, with its crops overlaid.
+
+    Zoom with the mouse wheel or a trackpad pinch (around the pointer); pan with
+    two-finger scrolling, or by dragging outside crop mode; double-click fits the
+    image again. In crop mode, dragging a rectangle over the image selects a new crop.
+    Crops and the dragged rectangle are kept as fractions of the image, so they
+    stay on the same image content at any zoom.
+    """
+
+    #: In crop mode the user dragged a rectangle: corners as fractions of the image.
+    rectSelected = Signal(float, float, float, float)
 
     def __init__(self) -> None:
         super().__init__()
-        self._pixmap: QPixmap | None = None
-        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._image: QImage | None = None
+        self._placeholder = ""
+        self._crops: list[ImageCrop] = []
+        self._selected_crop: int | None = None
+        self._crop_mode = False
+        #: Corners of a rectangle being dragged in crop mode, fractions of the image.
+        self._drag: tuple[QPointF, QPointF] | None = None
+        #: Magnification relative to the fitted image (1 = whole image visible).
+        self._zoom = 1.0
+        #: Image point (fractions) shown at the centre of the widget.
+        self._center = QPointF(0.5, 0.5)
+        #: Last pointer position while panning by dragging.
+        self._pan_from: QPointF | None = None
         self.setMinimumSize(200, 200)
         self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        self._update_cursor()
+
+    def image(self) -> QImage | None:
+        return self._image
 
     def set_image(self, image: QImage | None, placeholder: str = "") -> None:
-        self._pixmap = QPixmap.fromImage(image) if image is not None else None
-        if self._pixmap is None:
-            self.setPixmap(QPixmap())
-            self.setText(placeholder)
-        else:
-            self.setText("")
-            self._rescale()
+        self._image = image
+        self._placeholder = placeholder
+        self.reset_zoom()
+
+    def set_crops(self, crops: list[ImageCrop], selected: int | None) -> None:
+        self._crops, self._selected_crop = list(crops), selected
+        self.update()
+
+    def set_crop_mode(self, enabled: bool) -> None:
+        self._crop_mode = enabled
+        self._drag = None
+        self._update_cursor()
+        self.update()
+
+    def reset_zoom(self) -> None:
+        """Fit the whole image into the widget."""
+        self._zoom = 1.0
+        self._center = QPointF(0.5, 0.5)
+        self._update_cursor()
+        self.update()
+
+    # --- geometry -------------------------------------------------------
+
+    def _fitted_size(self) -> QSizeF:
+        assert self._image is not None
+        return QSizeF(self._image.size()).scaled(
+            QSizeF(self.size()), Qt.AspectRatioMode.KeepAspectRatio
+        )
+
+    def _image_rect(self) -> QRectF:
+        """Where the whole image is drawn (may extend beyond the widget when zoomed)."""
+        size = self._fitted_size() * self._zoom
+        view = QRectF(self.rect()).center()
+        return QRectF(
+            view.x() - self._center.x() * size.width(),
+            view.y() - self._center.y() * size.height(),
+            size.width(),
+            size.height(),
+        )
+
+    def _max_zoom(self) -> float:
+        """Zoom limit: about 8 screen pixels per image pixel."""
+        assert self._image is not None
+        fitted = self._fitted_size()
+        per_pixel = fitted.width() / max(1, self._image.width())
+        return max(1.0, 8.0 / max(per_pixel, 1e-6))
+
+    def _clamp_center(self) -> None:
+        """Keep the image covering the widget: no empty margin on a zoomed-in side."""
+        size = self._fitted_size() * self._zoom
+        center = []
+        for value, extent, view in (
+            (self._center.x(), size.width(), self.width()),
+            (self._center.y(), size.height(), self.height()),
+        ):
+            half = view / 2 / max(extent, 1e-6)
+            center.append(0.5 if half >= 0.5 else min(1.0 - half, max(half, value)))
+        self._center = QPointF(*center)
+
+    def zoom_at(self, factor: float, pos: QPointF) -> None:
+        """Multiply the zoom by ``factor``, keeping the image point under ``pos`` in place."""
+        if self._image is None:
+            return
+        zoom = min(self._max_zoom(), max(1.0, self._zoom * factor))
+        if zoom == self._zoom:
+            return
+        before = self._image_rect()
+        fx = (pos.x() - before.left()) / before.width()
+        fy = (pos.y() - before.top()) / before.height()
+        self._zoom = zoom
+        size = self._fitted_size() * zoom
+        view = QRectF(self.rect()).center()
+        self._center = QPointF(
+            fx + (view.x() - pos.x()) / size.width(),
+            fy + (view.y() - pos.y()) / size.height(),
+        )
+        self._clamp_center()
+        self._update_cursor()
+        self.update()
+
+    def pan_by(self, dx: float, dy: float) -> None:
+        """Move the image by ``dx``, ``dy`` widget pixels."""
+        if self._image is None or self._zoom <= 1.0:
+            return
+        size = self._fitted_size() * self._zoom
+        self._center -= QPointF(dx / size.width(), dy / size.height())
+        self._clamp_center()
+        self.update()
+
+    def _to_widget(self, target: QRectF, x: float, y: float, w: float, h: float) -> QRectF:
+        return QRectF(
+            target.left() + x * target.width(),
+            target.top() + y * target.height(),
+            w * target.width(),
+            h * target.height(),
+        )
+
+    def _fraction(self, pos: QPointF) -> QPointF:
+        """Image point (fractions, clamped to the image) under widget position ``pos``."""
+        target = self._image_rect()
+        x = (pos.x() - target.left()) / max(1.0, target.width())
+        y = (pos.y() - target.top()) / max(1.0, target.height())
+        return QPointF(min(1.0, max(0.0, x)), min(1.0, max(0.0, y)))
+
+    # --- painting -------------------------------------------------------
+
+    def paintEvent(self, _event: QPaintEvent) -> None:
+        painter = QPainter(self)
+        if self._image is None:
+            painter.setPen(self.palette().color(self.palette().ColorRole.WindowText))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._placeholder)
+            return
+        target = self._image_rect()
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        # Draw only the visible part of the image (cheap at high zoom).
+        visible = target.intersected(QRectF(self.rect()))
+        if not visible.isEmpty():
+            sx = self._image.width() / target.width()
+            sy = self._image.height() / target.height()
+            source = QRectF(
+                (visible.left() - target.left()) * sx,
+                (visible.top() - target.top()) * sy,
+                visible.width() * sx,
+                visible.height() * sy,
+            )
+            painter.drawImage(visible, self._image, source)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        fm = painter.fontMetrics()
+        for i, crop in enumerate(self._crops):
+            selected = i == self._selected_crop
+            rect = self._to_widget(target, crop.left, crop.top, crop.width, crop.height)
+            painter.fillRect(rect, CROP_SELECTED_FILL if selected else CROP_FILL)
+            painter.setPen(QPen(CROP_SELECTED_OUTLINE if selected else CROP_OUTLINE, 2))
+            painter.drawRect(rect)
+            label = str(i + 1)
+            # Keep the number visible while the crop's corner is scrolled out of view.
+            corner = QPointF(
+                min(max(rect.left(), 0.0), max(rect.left(), rect.right() - fm.height())),
+                min(max(rect.top(), 0.0), max(rect.top(), rect.bottom() - fm.height())),
+            )
+            box = QRectF(corner, QSizeF(fm.horizontalAdvance(label) + 8, fm.height() + 2))
+            painter.fillRect(box, CROP_SELECTED_OUTLINE if selected else CROP_OUTLINE)
+            painter.setPen(QColor(0, 0, 0))
+            painter.drawText(box, Qt.AlignmentFlag.AlignCenter, label)
+        if self._drag is not None:
+            a, b = self._drag
+            rect = self._to_widget(
+                target, min(a.x(), b.x()), min(a.y(), b.y()), abs(a.x() - b.x()), abs(a.y() - b.y())
+            )
+            painter.fillRect(rect, QColor(255, 255, 255, 50))
+            painter.setPen(QPen(QColor(255, 255, 255, 230), 1.5, Qt.PenStyle.DashLine))
+            painter.drawRect(rect)
+        if self._zoom > 1.0:
+            text = f"{self._zoom:.1f}×"
+            box = QRectF(
+                self.width() - fm.horizontalAdvance(text) - 14, 6,
+                fm.horizontalAdvance(text) + 8, fm.height() + 2,
+            )  # fmt: skip
+            painter.fillRect(box, QColor(0, 0, 0, 140))
+            painter.setPen(QColor(255, 255, 255))
+            painter.drawText(box, Qt.AlignmentFlag.AlignCenter, text)
 
     def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)
-        self._rescale()
+        if self._image is not None:
+            self._clamp_center()
 
-    def _rescale(self) -> None:
-        if self._pixmap is None:
+    # --- input ----------------------------------------------------------
+
+    def _update_cursor(self) -> None:
+        if self._crop_mode:
+            shape = Qt.CursorShape.CrossCursor
+        elif self._pan_from is not None:
+            shape = Qt.CursorShape.ClosedHandCursor
+        elif self._zoom > 1.0:
+            shape = Qt.CursorShape.OpenHandCursor
+        else:
+            shape = Qt.CursorShape.ArrowCursor
+        self.setCursor(shape)
+
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        if self._image is None:
             return
-        ratio = self.devicePixelRatioF()
-        scaled = self._pixmap.scaled(
-            self.size() * ratio,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
+        trackpad = (
+            event.phase() != Qt.ScrollPhase.NoScrollPhase
+            or event.pointingDevice().type() == QInputDevice.DeviceType.TouchPad
         )
-        scaled.setDevicePixelRatio(ratio)
-        self.setPixmap(scaled)
+        zoom_modifier = event.modifiers() & (
+            Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier
+        )
+        if trackpad and not zoom_modifier:
+            # Two-finger scroll pans (pinch arrives as a native gesture).
+            delta = event.pixelDelta()
+            if delta.isNull():
+                delta = event.angleDelta() / 8
+            self.pan_by(delta.x(), delta.y())
+        else:
+            # Mouse wheel, or Ctrl+scroll (pinch on Windows/Linux touchpads), zooms.
+            steps = event.angleDelta().y() / 120
+            if not steps:
+                steps = event.pixelDelta().y() / 50
+            self.zoom_at(1.25**steps, event.position())
+        event.accept()
+
+    def event(self, event: QEvent) -> bool:
+        if event.type() == QEvent.Type.NativeGesture:
+            gesture = event.gestureType()  # type: ignore[attr-defined]
+            if gesture == Qt.NativeGestureType.ZoomNativeGesture:
+                self.zoom_at(1.0 + event.value(), event.position())  # type: ignore[attr-defined]
+                return True
+            if gesture == Qt.NativeGestureType.SmartZoomNativeGesture:
+                if self._zoom > 1.0:
+                    self.reset_zoom()
+                else:
+                    self.zoom_at(2.5, event.position())  # type: ignore[attr-defined]
+                return True
+        return super().event(event)
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+        if not self._crop_mode and event.button() == Qt.MouseButton.LeftButton:
+            self.reset_zoom()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if self._image is None or event.button() != Qt.MouseButton.LeftButton:
+            return
+        if self._crop_mode:
+            point = self._fraction(event.position())
+            self._drag = (point, point)
+            self.update()
+        elif self._zoom > 1.0:
+            self._pan_from = event.position()
+            self._update_cursor()
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._drag is not None:
+            self._drag = (self._drag[0], self._fraction(event.position()))
+            self.update()
+        elif self._pan_from is not None:
+            delta = event.position() - self._pan_from
+            self._pan_from = event.position()
+            self.pan_by(delta.x(), delta.y())
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        if self._drag is not None:
+            start = self._drag[0]
+            end = self._fraction(event.position())
+            self._drag = None
+            self.update()
+            self.rectSelected.emit(start.x(), start.y(), end.x(), end.y())
+        elif self._pan_from is not None:
+            self._pan_from = None
+            self._update_cursor()
 
 
 class _AudioPlayer(QWidget):
     """Mel spectrogram, play/pause button, seek slider and position of an audio file."""
+
+    #: The spectrogram of the current recording was computed (or failed).
+    spectrogramReady = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -143,6 +444,8 @@ class _AudioPlayer(QWidget):
         self._seeking = False
         self._generation = 0
         self._tasks: set[_SpectrogramTask] = set()
+        self._spectrogram_image: QImage | None = None
+        self._duration = 0.0
         self._spectrogram = SpectrogramView()
         self._spectrogram.seekRequested.connect(self._player.setPosition)
         self._playhead = QTimer(self)
@@ -181,8 +484,21 @@ class _AudioPlayer(QWidget):
         self._player.playbackStateChanged.connect(self._on_state)
         self._player.errorOccurred.connect(self._on_error)
 
+    def spectrogram(self) -> SpectrogramView:
+        return self._spectrogram
+
+    def spectrogram_image(self) -> QImage | None:
+        """Colour spectrogram of the whole recording, once computed."""
+        return self._spectrogram_image
+
+    def duration(self) -> float:
+        """Length of the recording in seconds (0 until known)."""
+        return self._duration
+
     def set_source(self, media: MediaFile) -> None:
         self._player.stop()
+        self._spectrogram_image = None
+        self._duration = 0.0
         self._error.hide()
         self._slider.setRange(0, 0)
         self._player.setSource(QUrl.fromLocalFile(str(media.path)))
@@ -223,6 +539,9 @@ class _AudioPlayer(QWidget):
             self._spectrogram.set_message(str(result))
         else:
             self._spectrogram.set_spectrogram(spec, result)  # type: ignore[arg-type]
+            self._spectrogram_image = result  # type: ignore[assignment]
+            self._duration = spec.duration  # type: ignore[attr-defined]
+        self.spectrogramReady.emit()
 
     def _on_position(self, position: int) -> None:
         if not self._seeking:
@@ -248,10 +567,13 @@ class _AudioPlayer(QWidget):
 
 
 class PreviewWindow(QWidget):
-    """One media file: image or audio player, with date/EXIF metadata and detected species."""
+    """One media file: image or audio player, with its crops, date/EXIF metadata and
+    detected species."""
 
     #: User asked for the previous (-1) or next (+1) file in the list.
     navigateRequested = Signal(int)
+    #: User added or deleted crops: the file and all its crops (list[Crop]).
+    cropsChanged = Signal(object, object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent, Qt.WindowType.Window)
@@ -264,9 +586,17 @@ class PreviewWindow(QWidget):
         self._tasks: set[_LoadTask] = set()
         #: Placeholder row while EXIF metadata is being read.
         self._metadata_loading: QTreeWidgetItem | None = None
+        #: Crops of the previewed file, in the order they were made.
+        self._crops: list[Crop] = []
+        #: Species detected in the whole file and in its analysed crops.
+        self._predictions: list[SpeciesPrediction] | None = None
+        self._crop_detections: dict[Crop, list[SpeciesPrediction] | None] = {}
 
         self._image = _ImageView()
+        self._image.rectSelected.connect(self._on_image_rect)
         self._audio = _AudioPlayer()
+        self._audio.spectrogram().rangeSelected.connect(self._on_audio_range)
+        self._audio.spectrogramReady.connect(self._refresh_crop_icons)
         self._unsupported = QLabel("No preview for this file type")
         self._unsupported.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
@@ -302,7 +632,7 @@ class PreviewWindow(QWidget):
         for button, key in ((self._previous, Qt.Key.Key_Left), (self._next, Qt.Key.Key_Right)):
             shortcut = QShortcut(QKeySequence(key), self)
             shortcut.activated.connect(button.click)  # click() does nothing when disabled
-        QShortcut(QKeySequence(Qt.Key.Key_Escape), self).activated.connect(self.close)
+        QShortcut(QKeySequence(Qt.Key.Key_Escape), self).activated.connect(self._on_escape)
         navigation = QHBoxLayout()
         navigation.addWidget(self._previous)
         navigation.addWidget(self._position, 1)
@@ -322,8 +652,65 @@ class PreviewWindow(QWidget):
         splitter.setStretchFactor(1, 0)
         splitter.setSizes([820, 380])
 
+        self._crop_bar = self._build_crop_bar()
+
         layout = QVBoxLayout(self)
-        layout.addWidget(splitter)
+        layout.addWidget(self._crop_bar)
+        layout.addWidget(splitter, 1)
+
+    def _build_crop_bar(self) -> QWidget:
+        """Crop strip at the top of the window, with buttons to add and delete crops."""
+        self._add_crop = QPushButton("Add crop")
+        self._add_crop.setCheckable(True)
+        self._add_crop.setShortcut(QKeySequence("C"))
+        self._add_crop.toggled.connect(self._set_crop_mode)
+        self._delete_crop = QPushButton("Delete crop")
+        self._delete_crop.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_TrashIcon))
+        self._delete_crop.setToolTip("Delete the selected crop (Delete)")
+        self._delete_crop.setEnabled(False)
+        self._delete_crop.clicked.connect(self._delete_selected_crop)
+        self._crop_hint = QLabel()
+        self._crop_hint.setStyleSheet("color: palette(placeholder-text)")
+
+        self._crop_list = QListWidget()
+        self._crop_list.setViewMode(QListView.ViewMode.IconMode)
+        self._crop_list.setFlow(QListView.Flow.LeftToRight)
+        self._crop_list.setWrapping(False)
+        self._crop_list.setMovement(QListView.Movement.Static)
+        self._crop_list.setIconSize(_CROP_ICON)
+        self._crop_list.setSpacing(4)
+        self._crop_list.setWordWrap(False)
+        self._crop_list.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self._crop_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._crop_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._crop_list.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        fm = self.fontMetrics()
+        grid = QSize(
+            max(_CROP_ICON.width(), fm.horizontalAdvance("Eurasian Blackbird · 00%")) + 16,
+            _CROP_ICON.height() + 2 * fm.height() + 20,
+        )
+        self._crop_list.setGridSize(grid)
+        scrollbar = self.style().pixelMetric(QStyle.PixelMetric.PM_ScrollBarExtent)
+        self._crop_list.setFixedHeight(grid.height() + scrollbar + 6)
+        self._crop_list.currentRowChanged.connect(self._on_crop_selected)
+        self._crop_list.itemActivated.connect(self._on_crop_activated)
+        delete = QShortcut(QKeySequence(QKeySequence.StandardKey.Delete), self._crop_list)
+        delete.activated.connect(self._delete_selected_crop)
+        backspace = QShortcut(QKeySequence(Qt.Key.Key_Backspace), self._crop_list)
+        backspace.activated.connect(self._delete_selected_crop)
+
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.addWidget(QLabel("<b>Crops</b>"))
+        header.addWidget(self._add_crop)
+        header.addWidget(self._delete_crop)
+        header.addWidget(self._crop_hint, 1)
+        bar = QWidget()
+        layout = QVBoxLayout(bar)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addLayout(header)
+        layout.addWidget(self._crop_list)
+        return bar
 
     @staticmethod
     def _panel(title: str, content: QWidget) -> QWidget:
@@ -341,9 +728,15 @@ class PreviewWindow(QWidget):
         return self._media
 
     def show_media(
-        self, media: MediaFile, tz: tzinfo, predictions: list[SpeciesPrediction] | None
+        self,
+        media: MediaFile,
+        tz: tzinfo,
+        predictions: list[SpeciesPrediction] | None,
+        crops: list[Crop] | None = None,
+        crop_detections: dict[Crop, list[SpeciesPrediction] | None] | None = None,
     ) -> None:
-        """Preview ``media``; capture times are shown in ``tz``."""
+        """Preview ``media`` with its ``crops`` and the species detected in the file
+        and in its crops; capture times are shown in ``tz``."""
         self._media = media
         self._tz = tz
         self._generation += 1
@@ -354,16 +747,28 @@ class PreviewWindow(QWidget):
         self._image.setVisible(media.kind.is_image)
         self._audio.setVisible(is_audio)
         self._unsupported.setVisible(not (is_audio or media.kind.is_image))
+        self._crop_bar.setVisible(is_audio or media.kind.is_image)
+        self._add_crop.setChecked(False)
+        self._crops = [
+            c for c in crops or [] if isinstance(c, AudioCrop if is_audio else ImageCrop)
+        ]
+        self._add_crop.setToolTip(
+            "Drag over the spectrogram to crop a time range (C)"
+            if is_audio
+            else "Drag over the image to crop a region (C)"
+        )
 
         self._metadata.clear()
         self._metadata_loading = None
         self._add_datetime(media, tz)
-        self.set_predictions(predictions)
+        self.set_predictions(predictions, crop_detections)
 
         if is_audio:
             self._audio.set_source(media)
         elif media.kind.is_image:
             self._image.set_image(None, "Loading…")
+        self._refresh_crops()
+        if media.kind.is_image:
             self._metadata_loading = QTreeWidgetItem(["EXIF", "Loading…"])
             self._metadata.addTopLevelItem(self._metadata_loading)
             task = _LoadTask(media, self._generation)
@@ -391,9 +796,37 @@ class PreviewWindow(QWidget):
             self._metadata.takeTopLevelItem(0)  # the "Date and time" group
         self._add_datetime(self._media, tz)
 
-    def set_predictions(self, predictions: list[SpeciesPrediction] | None) -> None:
-        """Show the top detected species of the previewed file."""
+    def set_predictions(
+        self,
+        predictions: list[SpeciesPrediction] | None,
+        crop_detections: dict[Crop, list[SpeciesPrediction] | None] | None = None,
+    ) -> None:
+        """Show the top species detected in the previewed file and in each of its crops."""
+        self._predictions = predictions
+        self._crop_detections = dict(crop_detections or {})
+        self._show_species()
+        self._update_crop_labels()
+
+    def _show_species(self) -> None:
         self._species.clear()
+        if not self._crops:
+            self._add_species(self._predictions)
+            return
+        self._add_species_header("Whole file")
+        self._add_species(self._predictions)
+        for i, crop in enumerate(self._crops):
+            self._add_species_header(f"Crop {i + 1} · {crop.label()}")
+            self._add_species(self._crop_detections.get(crop))
+
+    def _add_species_header(self, text: str) -> None:
+        item = QListWidgetItem(text)
+        item.setFlags(Qt.ItemFlag.ItemIsEnabled)  # not selectable, but not greyed out
+        font = item.font()
+        font.setBold(True)
+        item.setFont(font)
+        self._species.addItem(item)
+
+    def _add_species(self, predictions: list[SpeciesPrediction] | None) -> None:
         hits = detected(predictions)[:_TOP_SPECIES]
         if not hits:
             text = "Not analysed yet" if predictions is None else "No species detected"
@@ -442,6 +875,165 @@ class PreviewWindow(QWidget):
     def _on_image(self, generation: int, image: QImage | None) -> None:
         if generation == self._generation:
             self._image.set_image(image, "Cannot display this image")
+            self._refresh_crop_icons()
+
+    # --- crops ----------------------------------------------------------
+
+    def _on_escape(self) -> None:
+        if self._add_crop.isChecked():
+            self._add_crop.setChecked(False)
+        else:
+            self.close()
+
+    def _set_crop_mode(self, enabled: bool) -> None:
+        self._image.set_crop_mode(enabled)
+        self._audio.spectrogram().set_crop_mode(enabled)
+        self._update_crop_hint()
+
+    def _on_image_rect(self, x0: float, y0: float, x1: float, y1: float) -> None:
+        crop = make_image_crop(x0, y0, x1, y1)
+        if crop is not None:
+            self._add(crop)
+
+    def _on_audio_range(self, t0: float, t1: float) -> None:
+        crop = make_audio_crop(t0, t1, self._audio.duration())
+        if crop is not None:
+            self._add(crop)
+
+    def _add(self, crop: Crop) -> None:
+        self._crops.append(crop)
+        self._refresh_crops(select=len(self._crops) - 1)
+        self._emit_crops()
+
+    def _delete_selected_crop(self) -> None:
+        row = self._crop_list.currentRow()
+        if not 0 <= row < len(self._crops):
+            return
+        del self._crops[row]
+        self._refresh_crops(select=min(row, len(self._crops) - 1) if self._crops else None)
+        self._emit_crops()
+
+    def _emit_crops(self) -> None:
+        if self._media is not None:
+            self.cropsChanged.emit(self._media, list(self._crops))
+
+    def _selected_crop(self) -> int | None:
+        row = self._crop_list.currentRow()
+        return row if 0 <= row < len(self._crops) else None
+
+    def _refresh_crops(self, select: int | None = None) -> None:
+        """Rebuild the crop strip and the overlays from ``self._crops``."""
+        self._crop_list.blockSignals(True)
+        self._crop_list.clear()
+        for crop in self._crops:
+            item = QListWidgetItem()
+            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            # A static icon view places items once, by their size when added; the
+            # label and thumbnail come later, so give each item its full cell now.
+            item.setSizeHint(self._crop_list.gridSize())
+            self._crop_list.addItem(item)
+        if select is not None:
+            self._crop_list.setCurrentRow(select)
+        self._crop_list.blockSignals(False)
+        self._update_crop_labels()
+        self._show_species()
+        self._refresh_crop_icons()
+        self._update_overlays()
+        self._update_crop_hint()
+        if select is not None:
+            # clear() reset the scroll position: bring the selected crop into view
+            # once the view has laid out the new items (it delays that).
+            QTimer.singleShot(0, self._scroll_to_selected_crop)
+
+    def _scroll_to_selected_crop(self) -> None:
+        item = self._crop_list.currentItem()
+        if item is not None:
+            self._crop_list.scrollToItem(item)
+
+    def _update_crop_labels(self) -> None:
+        """Number, size or time range and top detected species of each crop in the strip."""
+        for i, crop in enumerate(self._crops):
+            item = self._crop_list.item(i)
+            if item is None:
+                continue
+            predictions = self._crop_detections.get(crop)
+            top = detected(predictions)[:1]
+            if top:
+                species = f"{top[0].display_name} · {top[0].score:.0%}"
+            elif crop in self._crop_detections and predictions is not None:
+                species = "No species"
+            else:
+                species = "Not analysed"
+            item.setText(f"{i + 1} · {crop.label()}\n{species}")
+            tip = [species if top else f"Species: {species.lower()}"]
+            if isinstance(crop, AudioCrop):
+                tip.append("Double-click to play this range")
+            item.setToolTip("\n".join(tip))
+
+    def _refresh_crop_icons(self) -> None:
+        """Thumbnails of the crops, cut from the preview image or the spectrogram."""
+        for i, crop in enumerate(self._crops):
+            item = self._crop_list.item(i)
+            if item is None:
+                continue
+            pixmap = self._crop_pixmap(crop)
+            item.setIcon(QIcon(pixmap) if pixmap is not None else QIcon())
+
+    def _crop_pixmap(self, crop: Crop) -> QPixmap | None:
+        if isinstance(crop, ImageCrop):
+            source = self._image.image()
+            if source is None:
+                return None
+            w, h = source.width(), source.height()
+            rect = QRect(
+                round(crop.left * w), round(crop.top * h),
+                max(1, round(crop.width * w)), max(1, round(crop.height * h)),
+            )  # fmt: skip
+        else:
+            source = self._audio.spectrogram_image()
+            duration = self._audio.duration()
+            if source is None or duration <= 0:
+                return None
+            w = source.width()
+            x0 = round(crop.start / duration * w)
+            rect = QRect(x0, 0, max(1, round(crop.end / duration * w) - x0), source.height())
+        ratio = self.devicePixelRatioF()
+        scaled = QPixmap.fromImage(source.copy(rect)).scaled(
+            _CROP_ICON * ratio,
+            Qt.AspectRatioMode.KeepAspectRatio
+            if isinstance(crop, ImageCrop)
+            else Qt.AspectRatioMode.IgnoreAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        scaled.setDevicePixelRatio(ratio)
+        return scaled
+
+    def _update_overlays(self) -> None:
+        selected = self._selected_crop()
+        self._image.set_crops([c for c in self._crops if isinstance(c, ImageCrop)], selected)
+        self._audio.spectrogram().set_crops(
+            [(c.start, c.end) for c in self._crops if isinstance(c, AudioCrop)], selected
+        )
+        self._delete_crop.setEnabled(selected is not None)
+
+    def _update_crop_hint(self) -> None:
+        if self._add_crop.isChecked():
+            is_audio = self._media is not None and self._media.kind is MediaKind.AUDIO
+            target = "spectrogram" if is_audio else "image"
+            text = f"Drag over the {target} to add a crop · Esc to finish"
+        elif not self._crops:
+            text = "No crops yet"
+        else:
+            text = f"{len(self._crops)} crop{'s' if len(self._crops) != 1 else ''}"
+        self._crop_hint.setText(text)
+
+    def _on_crop_selected(self, _row: int) -> None:
+        self._update_overlays()
+
+    def _on_crop_activated(self, item: QListWidgetItem) -> None:
+        crop = self._crops[self._crop_list.row(item)]
+        if isinstance(crop, AudioCrop) and self._audio.isVisible():
+            self._audio.play_from(crop.start)
 
     def _on_metadata(self, generation: int, entries: list[MetadataEntry]) -> None:
         if generation != self._generation:

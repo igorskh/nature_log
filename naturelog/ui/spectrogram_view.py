@@ -1,4 +1,5 @@
-"""Mel spectrogram display with frequency/time axes and a playback position line."""
+"""Mel spectrogram display with frequency/time axes, a playback position line and
+cropped time ranges."""
 
 from __future__ import annotations
 
@@ -8,6 +9,12 @@ from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter, QPaintEvent, QP
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
 from naturelog.media.spectrogram import MelSpectrogram, hz_to_mel
+
+#: Fill and outline of cropped ranges; the selected crop is drawn stronger.
+CROP_FILL = QColor(80, 200, 255, 55)
+CROP_SELECTED_FILL = QColor(255, 210, 60, 70)
+CROP_OUTLINE = QColor(80, 200, 255, 220)
+CROP_SELECTED_OUTLINE = QColor(255, 210, 60, 255)
 
 #: Magma-like colour map anchors, low → high.
 _ANCHORS = np.array(
@@ -62,10 +69,13 @@ def _format_khz(hz: float) -> str:
 
 
 class SpectrogramView(QWidget):
-    """Paints a :class:`MelSpectrogram`; click or drag to seek."""
+    """Paints a :class:`MelSpectrogram`; click or drag to seek, or, in crop mode,
+    drag to select a time range."""
 
     #: User clicked/dragged to this position, milliseconds.
     seekRequested = Signal(int)
+    #: In crop mode the user dragged over this range: start, end seconds (any order).
+    rangeSelected = Signal(float, float)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -73,6 +83,12 @@ class SpectrogramView(QWidget):
         self._image: QImage | None = None
         self._message = ""
         self._position_ms = 0
+        #: Cropped ranges, seconds, and the index of the highlighted one.
+        self._crops: list[tuple[float, float]] = []
+        self._selected_crop: int | None = None
+        self._crop_mode = False
+        #: Start and current time of a range being dragged in crop mode, seconds.
+        self._drag: tuple[float, float] | None = None
         self.setMinimumHeight(180)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -87,6 +103,20 @@ class SpectrogramView(QWidget):
 
     def set_spectrogram(self, spec: MelSpectrogram, image: QImage) -> None:
         self._spec, self._image, self._message = spec, image, ""
+        self.update()
+
+    def set_crops(self, ranges: list[tuple[float, float]], selected: int | None) -> None:
+        """Cropped ``(start, end)`` ranges in seconds to overlay; ``selected`` is highlighted."""
+        self._crops, self._selected_crop = list(ranges), selected
+        self.update()
+
+    def set_crop_mode(self, enabled: bool) -> None:
+        """While enabled, dragging selects a range instead of seeking."""
+        self._crop_mode = enabled
+        self._drag = None
+        self.setCursor(
+            Qt.CursorShape.CrossCursor if enabled else Qt.CursorShape.PointingHandCursor
+        )
         self.update()
 
     def set_position(self, ms: int) -> None:
@@ -131,10 +161,36 @@ class SpectrogramView(QWidget):
 
         duration = self._spec.duration
         if duration > 0:
+            self._draw_crops(painter, plot, duration)
             x = plot.left() + min(1.0, self._position_ms / 1000 / duration) * plot.width()
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
             painter.setPen(QPen(QColor(255, 255, 255, 230), 1.5))
             painter.drawLine(QPointF(x, plot.top()), QPointF(x, plot.bottom() + 1))
+
+    def _draw_crops(self, painter: QPainter, plot: QRect, duration: float) -> None:
+        def band(start: float, end: float) -> QRectF:
+            x0 = plot.left() + min(start, end) / duration * plot.width()
+            x1 = plot.left() + max(start, end) / duration * plot.width()
+            return QRectF(x0, plot.top(), max(1.0, x1 - x0), plot.height())
+
+        fm = painter.fontMetrics()
+        for i, (start, end) in enumerate(self._crops):
+            selected = i == self._selected_crop
+            rect = band(start, end)
+            painter.fillRect(rect, CROP_SELECTED_FILL if selected else CROP_FILL)
+            painter.setPen(QPen(CROP_SELECTED_OUTLINE if selected else CROP_OUTLINE, 1.5))
+            painter.drawLine(rect.topLeft(), rect.bottomLeft())
+            painter.drawLine(rect.topRight(), rect.bottomRight())
+            painter.drawText(
+                QRectF(rect.left() + 3, rect.top() + 2, fm.horizontalAdvance("000"), fm.height()),
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
+                str(i + 1),
+            )
+        if self._drag is not None:
+            rect = band(*self._drag)
+            painter.fillRect(rect, QColor(255, 255, 255, 50))
+            painter.setPen(QPen(QColor(255, 255, 255, 230), 1, Qt.PenStyle.DashLine))
+            painter.drawRect(rect)
 
     def _draw_frequency_axis(self, painter: QPainter, plot: QRect) -> None:
         assert self._spec is not None
@@ -180,20 +236,43 @@ class SpectrogramView(QWidget):
 
     # --- seeking --------------------------------------------------------
 
+    def _time_at(self, event: QMouseEvent) -> float:
+        assert self._spec is not None
+        plot = self._plot_rect()
+        fraction = (event.position().x() - plot.left()) / max(1, plot.width())
+        return min(1.0, max(0.0, fraction)) * self._spec.duration
+
     def mousePressEvent(self, event: QMouseEvent) -> None:
+        if self._crop_mode:
+            if self._spec is not None and event.button() == Qt.MouseButton.LeftButton:
+                t = self._time_at(event)
+                self._drag = (t, t)
+                self.update()
+            return
         self._seek(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        if event.buttons() & Qt.MouseButton.LeftButton:
-            self._seek(event)
+        if not event.buttons() & Qt.MouseButton.LeftButton:
+            return
+        if self._crop_mode:
+            if self._drag is not None:
+                self._drag = (self._drag[0], self._time_at(event))
+                self.update()
+            return
+        self._seek(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if self._crop_mode and self._drag is not None and event.button() == Qt.MouseButton.LeftButton:
+            start, _ = self._drag
+            self._drag = None
+            self.update()
+            self.rangeSelected.emit(start, self._time_at(event))
 
     def _seek(self, event: QMouseEvent) -> None:
         if self._spec is None or event.button() not in (
             Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton
         ):
             return
-        plot = self._plot_rect()
-        fraction = (event.position().x() - plot.left()) / max(1, plot.width())
-        ms = int(min(1.0, max(0.0, fraction)) * self._spec.duration * 1000)
+        ms = int(self._time_at(event) * 1000)
         self.set_position(ms)
         self.seekRequested.emit(ms)

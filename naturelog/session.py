@@ -25,6 +25,7 @@ from typing import Any
 
 from naturelog.gps import TrackPosition
 from naturelog.media import MediaFile, MediaKind, TimeSource
+from naturelog.media.crops import Crop, crop_from_json, crop_to_json
 from naturelog.species import DetectionConfig, SpeciesPrediction
 from naturelog.timezones import UTC_NAME, get_timezone
 
@@ -48,6 +49,10 @@ class SessionMedia:
     detections: list[SpeciesPrediction] | None = None
     #: ``(latitude, longitude)`` the user moved the file to; replaces the track position.
     moved_to: tuple[float, float] | None = None
+    #: Regions (photos) or time ranges (recordings) the user cropped; originals stay unchanged.
+    crops: list[Crop] = field(default_factory=list)
+    #: Species candidates of crops from their last detection run (analysed crops only).
+    crop_detections: dict[Crop, list[SpeciesPrediction] | None] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -121,6 +126,16 @@ def _position_from_json(data: dict[str, Any] | None) -> TrackPosition | None:
     )
 
 
+def _crop_to_json(
+    crop: Crop, detections: dict[Crop, list[SpeciesPrediction] | None]
+) -> dict[str, Any]:
+    data = crop_to_json(crop)
+    if crop in detections:
+        predictions = detections[crop]
+        data["detections"] = None if predictions is None else [p.to_json() for p in predictions]
+    return data
+
+
 def _media_to_json(entry: SessionMedia, base: Path | None) -> dict[str, Any]:
     media = entry.media
     return {
@@ -138,6 +153,7 @@ def _media_to_json(entry: SessionMedia, base: Path | None) -> dict[str, Any]:
         if entry.detections is None
         else [p.to_json() for p in entry.detections],
         "moved_to": None if entry.moved_to is None else list(entry.moved_to),
+        "crops": [_crop_to_json(crop, entry.crop_detections) for crop in entry.crops],
     }
 
 
@@ -153,11 +169,21 @@ def _media_from_json(data: dict[str, Any], base: Path | None) -> SessionMedia:
     )
     detections = data.get("detections")
     moved = data.get("moved_to")
+    crop_items = data.get("crops") or []
+    crops = [crop_from_json(item) for item in crop_items]
     return SessionMedia(
         media,
         _position_from_json(data.get("position")),
         None if detections is None else [SpeciesPrediction.from_json(d) for d in detections],
         None if moved is None else (float(moved[0]), float(moved[1])),
+        crops,
+        {
+            crop: [SpeciesPrediction.from_json(d) for d in item["detections"]]
+            if item["detections"] is not None
+            else None
+            for crop, item in zip(crops, crop_items)
+            if "detections" in item
+        },
     )
 
 

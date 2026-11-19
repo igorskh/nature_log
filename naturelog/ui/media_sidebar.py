@@ -60,6 +60,7 @@ from naturelog.media import (
     make_thumbnails,
     read_media_files,
 )
+from naturelog.media.crops import Crop
 from naturelog.media.edit_datetime import DatetimeEdit, EditResult, edit_datetimes
 from naturelog.media.exiftool import exiftool_path
 from naturelog.media.formats import has_exif
@@ -78,6 +79,10 @@ _ROLE_DETECTIONS = Qt.ItemDataRole.UserRole + 1
 _ROLE_GPS = Qt.ItemDataRole.UserRole + 2
 #: ``(latitude, longitude)`` the user moved the file to on the map, or None.
 _ROLE_MOVED = Qt.ItemDataRole.UserRole + 3
+#: list[Crop] of a listed file (empty or None if not cropped).
+_ROLE_CROPS = Qt.ItemDataRole.UserRole + 4
+#: dict[Crop, list[SpeciesPrediction] | None] from the last detection run of each crop.
+_ROLE_CROP_DETECTIONS = Qt.ItemDataRole.UserRole + 5
 _BADGE_SIZE = 20
 _BADGE_COLOR = QColor(46, 139, 87)
 _GLOBE_SIZE = 18
@@ -337,6 +342,8 @@ class MediaSidebar(QWidget):
     detectionsChanged = Signal()
     #: Emitted when files were moved to (or reset from) a position chosen on the map.
     positionsChanged = Signal()
+    #: Emitted when crops of files changed.
+    cropsChanged = Signal()
     #: User asked to detect species in these :class:`MediaFile` photos/recordings.
     detectRequested = Signal(list)
     #: User asked to upload these selected :class:`MediaFile` objects to iNaturalist.
@@ -547,6 +554,68 @@ class MediaSidebar(QWidget):
         if changed:
             self._update_count()
             self.positionsChanged.emit()
+
+    def crops_for(self, media: MediaFile) -> list[Crop]:
+        """Crops of a listed file (empty if none)."""
+        item = self._items.get(media.path)
+        return [] if item is None else list(item.data(_ROLE_CROPS) or [])
+
+    def set_crops(self, crops: dict[Path, list[Crop]]) -> None:
+        """Store crops of listed files (unlisted paths are ignored)."""
+        changed = pruned = False
+        for path, file_crops in crops.items():
+            item = self._items.get(path)
+            if item is None or list(item.data(_ROLE_CROPS) or []) == file_crops:
+                continue
+            item.setData(_ROLE_CROPS, list(file_crops))
+            # Results of deleted crops go with them.
+            results = item.data(_ROLE_CROP_DETECTIONS) or {}
+            kept = {c: p for c, p in results.items() if c in file_crops}
+            if len(kept) != len(results):
+                item.setData(_ROLE_CROP_DETECTIONS, kept)
+                pruned = True
+            changed = True
+        if changed:
+            self.cropsChanged.emit()
+        if pruned:
+            self.detectionsChanged.emit()
+
+    def crop_detections_for(self, media: MediaFile) -> dict[Crop, list[SpeciesPrediction] | None]:
+        """Species predictions of the file's crops that were analysed."""
+        item = self._items.get(media.path)
+        return {} if item is None else dict(item.data(_ROLE_CROP_DETECTIONS) or {})
+
+    def set_crop_detections(
+        self, results: dict[Path, dict[Crop, list[SpeciesPrediction] | None]]
+    ) -> None:
+        """Store species predictions of crops of listed files (other crops keep theirs)."""
+        changed = False
+        for path, by_crop in results.items():
+            item = self._items.get(path)
+            if item is None:
+                continue
+            crops = item.data(_ROLE_CROPS) or []
+            stored = dict(item.data(_ROLE_CROP_DETECTIONS) or {})
+            stored.update({c: p for c, p in by_crop.items() if c in crops})
+            item.setData(_ROLE_CROP_DETECTIONS, stored)
+            changed = True
+        if changed:
+            self.detectionsChanged.emit()
+
+    def unanalysed_crops(self, media: MediaFile) -> list[Crop]:
+        """Crops of the file species detection has not run on yet."""
+        done = self.crop_detections_for(media)
+        return [c for c in self.crops_for(media) if c not in done]
+
+    def species_detections(self) -> dict[Path, list[SpeciesPrediction]]:
+        """Predictions per listed file, its crops' included (for the species summary)."""
+        result: dict[Path, list[SpeciesPrediction]] = {}
+        for path, item in self._items.items():
+            predictions = list(item.data(_ROLE_DETECTIONS) or [])
+            for crop_predictions in (item.data(_ROLE_CROP_DETECTIONS) or {}).values():
+                predictions += crop_predictions or []
+            result[path] = predictions
+        return result
 
     def move_selected_to(self, latitude: float, longitude: float) -> None:
         """Move the selected files to this position (they keep their track position too)."""
