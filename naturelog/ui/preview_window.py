@@ -302,6 +302,7 @@ class PreviewWindow(QWidget):
         for button, key in ((self._previous, Qt.Key.Key_Left), (self._next, Qt.Key.Key_Right)):
             shortcut = QShortcut(QKeySequence(key), self)
             shortcut.activated.connect(button.click)  # click() does nothing when disabled
+        QShortcut(QKeySequence(Qt.Key.Key_Escape), self).activated.connect(self.close)
         navigation = QHBoxLayout()
         navigation.addWidget(self._previous)
         navigation.addWidget(self._position, 1)
