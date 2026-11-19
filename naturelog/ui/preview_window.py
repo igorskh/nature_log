@@ -60,7 +60,8 @@ from naturelog.media import MediaFile, MediaKind, TimeSource, make_thumbnail
 from naturelog.media.crops import AudioCrop, Crop, ImageCrop, make_audio_crop, make_image_crop
 from naturelog.media.exif_details import MetadataEntry, read_metadata
 from naturelog.media.spectrogram import SpectrogramError, compute_mel_spectrogram
-from naturelog.species import SpeciesPrediction, detected
+from naturelog.species import DetectorUnavailable, SpeciesPrediction, detected
+from naturelog.species.objects import DetectedBox, ObjectDetector
 from naturelog.timezones import format_datetime
 from naturelog.ui.spectrogram_view import (
     CROP_FILL,
@@ -80,6 +81,22 @@ _ROLE_START = Qt.ItemDataRole.UserRole
 _PLAYHEAD_INTERVAL = 33
 #: Size of crop thumbnails in the crop strip, px.
 _CROP_ICON = QSize(120, 80)
+#: Distance from a crop edge that still grabs the edge, px.
+_HANDLE_TOLERANCE = 6.0
+#: Smallest side of a crop while resizing it, fraction of the image.
+_MIN_CROP = 0.005
+#: Cursor shown over each crop handle.
+_HANDLE_CURSORS = {
+    "l": Qt.CursorShape.SizeHorCursor,
+    "r": Qt.CursorShape.SizeHorCursor,
+    "t": Qt.CursorShape.SizeVerCursor,
+    "b": Qt.CursorShape.SizeVerCursor,
+    "lt": Qt.CursorShape.SizeFDiagCursor,
+    "rb": Qt.CursorShape.SizeFDiagCursor,
+    "rt": Qt.CursorShape.SizeBDiagCursor,
+    "lb": Qt.CursorShape.SizeBDiagCursor,
+    "move": Qt.CursorShape.SizeAllCursor,
+}
 
 
 def _clock(ms: int) -> str:
@@ -135,6 +152,30 @@ class _SpectrogramTask(QRunnable):
         self.signals.done.emit(self.generation, spec, spectrogram_image(spec))
 
 
+class _BoxesSignals(QObject):
+    done = Signal(int, object)  # generation, list[DetectedBox] | str (error)
+
+
+class _BoxesTask(QRunnable):
+    """Detects object bounding boxes in a photo off the UI thread."""
+
+    def __init__(self, detector: ObjectDetector, media: MediaFile, generation: int) -> None:
+        super().__init__()
+        self.detector = detector
+        self.media = media
+        self.generation = generation
+        self.signals = _BoxesSignals()
+
+    def run(self) -> None:
+        try:
+            result: object = self.detector.detect(self.media)
+        except DetectorUnavailable as exc:
+            result = str(exc)
+        except Exception as exc:  # noqa: BLE001 – report any model failure to the user
+            result = f"Box detection failed: {exc}"
+        self.signals.done.emit(self.generation, result)
+
+
 # --- widgets --------------------------------------------------------------
 
 
@@ -150,6 +191,10 @@ class _ImageView(QWidget):
 
     #: In crop mode the user dragged a rectangle: corners as fractions of the image.
     rectSelected = Signal(float, float, float, float)
+    #: User pressed on crop ``index`` (to select it).
+    cropClicked = Signal(int)
+    #: User resized or moved crop ``index``: the new ImageCrop.
+    cropEdited = Signal(int, object)
 
     def __init__(self) -> None:
         super().__init__()
@@ -160,6 +205,10 @@ class _ImageView(QWidget):
         self._crop_mode = False
         #: Corners of a rectangle being dragged in crop mode, fractions of the image.
         self._drag: tuple[QPointF, QPointF] | None = None
+        #: Crop being resized or moved: index, handle, crop before the drag and the
+        #: (unclamped) image point where the drag started.
+        self._edit: tuple[int, str, ImageCrop, QPointF] | None = None
+        self.setMouseTracking(True)  # hover cursors over crop edges
         #: Magnification relative to the fitted image (1 = whole image visible).
         self._zoom = 1.0
         #: Image point (fractions) shown at the centre of the widget.
@@ -180,11 +229,14 @@ class _ImageView(QWidget):
 
     def set_crops(self, crops: list[ImageCrop], selected: int | None) -> None:
         self._crops, self._selected_crop = list(crops), selected
+        if self._edit is not None and self._edit[0] >= len(self._crops):
+            self._edit = None
         self.update()
 
     def set_crop_mode(self, enabled: bool) -> None:
         self._crop_mode = enabled
         self._drag = None
+        self._edit = None
         self._update_cursor()
         self.update()
 
@@ -271,12 +323,77 @@ class _ImageView(QWidget):
             h * target.height(),
         )
 
-    def _fraction(self, pos: QPointF) -> QPointF:
-        """Image point (fractions, clamped to the image) under widget position ``pos``."""
+    def _fraction(self, pos: QPointF, clamp: bool = True) -> QPointF:
+        """Image point (fractions, clamped to the image unless ``clamp`` is false)
+        under widget position ``pos``."""
         target = self._image_rect()
         x = (pos.x() - target.left()) / max(1.0, target.width())
         y = (pos.y() - target.top()) / max(1.0, target.height())
+        if not clamp:
+            return QPointF(x, y)
         return QPointF(min(1.0, max(0.0, x)), min(1.0, max(0.0, y)))
+
+    # --- crop editing ---------------------------------------------------
+
+    def _hit(self, pos: QPointF) -> tuple[int, str] | None:
+        """Crop and handle under ``pos``: a handle is a combination of ``l``, ``r``,
+        ``t``, ``b`` for an edge or corner, or ``move`` for the inside of the crop.
+        The selected crop wins, then the topmost (last drawn) one; outside crop mode
+        a crop's inside counts only if no edge of another crop is under ``pos``."""
+        if self._image is None or not self._crops:
+            return None
+        target = self._image_rect()
+        order = list(reversed(range(len(self._crops))))
+        if self._selected_crop is not None and 0 <= self._selected_crop < len(self._crops):
+            order.remove(self._selected_crop)
+            order.insert(0, self._selected_crop)
+        inside: int | None = None
+        for i in order:
+            c = self._crops[i]
+            rect = self._to_widget(target, c.left, c.top, c.width, c.height)
+            tol = min(_HANDLE_TOLERANCE, rect.width() / 3, rect.height() / 3)
+            tol = max(tol, 3.0)
+            if not rect.adjusted(-tol, -tol, tol, tol).contains(pos):
+                continue
+            x, y = pos.x(), pos.y()
+            handle = ""
+            if abs(x - rect.left()) <= tol:
+                handle += "l"
+            elif abs(x - rect.right()) <= tol:
+                handle += "r"
+            if abs(y - rect.top()) <= tol:
+                handle += "t"
+            elif abs(y - rect.bottom()) <= tol:
+                handle += "b"
+            if handle:
+                return i, handle
+            if inside is None and rect.contains(pos):
+                inside = i
+        if inside is not None and not self._crop_mode:
+            return inside, "move"
+        return None
+
+    def _edited_crop(self, pos: QPointF) -> ImageCrop:
+        """Crop being edited, with the drag so far applied to the handle."""
+        assert self._edit is not None
+        _, handle, crop, start = self._edit
+        point = self._fraction(pos, clamp=False)
+        dx, dy = point.x() - start.x(), point.y() - start.y()
+        left, top = crop.left, crop.top
+        right, bottom = crop.left + crop.width, crop.top + crop.height
+        if handle == "move":
+            dx = min(1.0 - right, max(-left, dx))
+            dy = min(1.0 - bottom, max(-top, dy))
+            return ImageCrop(left + dx, top + dy, crop.width, crop.height)
+        if "l" in handle:
+            left = min(right - _MIN_CROP, max(0.0, left + dx))
+        if "r" in handle:
+            right = max(left + _MIN_CROP, min(1.0, right + dx))
+        if "t" in handle:
+            top = min(bottom - _MIN_CROP, max(0.0, top + dy))
+        if "b" in handle:
+            bottom = max(top + _MIN_CROP, min(1.0, bottom + dy))
+        return ImageCrop(left, top, right - left, bottom - top)
 
     # --- painting -------------------------------------------------------
 
@@ -343,8 +460,13 @@ class _ImageView(QWidget):
 
     # --- input ----------------------------------------------------------
 
-    def _update_cursor(self) -> None:
-        if self._crop_mode:
+    def _update_cursor(self, hover: QPointF | None = None) -> None:
+        hit = self._hit(hover) if hover is not None and self._pan_from is None else None
+        if self._edit is not None:
+            shape = _HANDLE_CURSORS[self._edit[1]]
+        elif hit is not None:
+            shape = _HANDLE_CURSORS[hit[1]]
+        elif self._crop_mode:
             shape = Qt.CursorShape.CrossCursor
         elif self._pan_from is not None:
             shape = Qt.CursorShape.ClosedHandCursor
@@ -393,13 +515,24 @@ class _ImageView(QWidget):
         return super().event(event)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
-        if not self._crop_mode and event.button() == Qt.MouseButton.LeftButton:
+        if (
+            not self._crop_mode
+            and event.button() == Qt.MouseButton.LeftButton
+            and self._hit(event.position()) is None
+        ):
             self.reset_zoom()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if self._image is None or event.button() != Qt.MouseButton.LeftButton:
             return
-        if self._crop_mode:
+        hit = self._hit(event.position())
+        if hit is not None:
+            index, handle = hit
+            start = self._fraction(event.position(), clamp=False)
+            self._edit = (index, handle, self._crops[index], start)
+            self._update_cursor()
+            self.cropClicked.emit(index)
+        elif self._crop_mode:
             point = self._fraction(event.position())
             self._drag = (point, point)
             self.update()
@@ -408,18 +541,32 @@ class _ImageView(QWidget):
             self._update_cursor()
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        if self._drag is not None:
+        if self._edit is not None:
+            self._crops[self._edit[0]] = self._edited_crop(event.position())
+            self.update()
+        elif self._drag is not None:
             self._drag = (self._drag[0], self._fraction(event.position()))
             self.update()
         elif self._pan_from is not None:
             delta = event.position() - self._pan_from
             self._pan_from = event.position()
             self.pan_by(delta.x(), delta.y())
+        else:
+            self._update_cursor(event.position())
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         if event.button() != Qt.MouseButton.LeftButton:
             return
-        if self._drag is not None:
+        if self._edit is not None:
+            index, _, original, _ = self._edit
+            crop = self._edited_crop(event.position())
+            self._edit = None
+            self._crops[index] = crop
+            self._update_cursor(event.position())
+            self.update()
+            if crop != original:
+                self.cropEdited.emit(index, crop)
+        elif self._drag is not None:
             start = self._drag[0]
             end = self._fraction(event.position())
             self._drag = None
@@ -591,9 +738,18 @@ class PreviewWindow(QWidget):
         #: Species detected in the whole file and in its analysed crops.
         self._predictions: list[SpeciesPrediction] | None = None
         self._crop_detections: dict[Crop, list[SpeciesPrediction] | None] = {}
+        #: Object detector for "Detect boxes"; its model loads on first use.
+        self._box_detector = ObjectDetector()
+        self._box_tasks: set[_BoxesTask] = set()
+        #: Generation of the running box detection, or None.
+        self._boxes_running: int | None = None
+        #: Result of the last box detection, shown in the crop hint.
+        self._boxes_message = ""
 
         self._image = _ImageView()
         self._image.rectSelected.connect(self._on_image_rect)
+        self._image.cropClicked.connect(lambda row: self._crop_list.setCurrentRow(row))
+        self._image.cropEdited.connect(self._on_crop_edited)
         self._audio = _AudioPlayer()
         self._audio.spectrogram().rangeSelected.connect(self._on_audio_range)
         self._audio.spectrogramReady.connect(self._refresh_crop_icons)
@@ -669,6 +825,11 @@ class PreviewWindow(QWidget):
         self._delete_crop.setToolTip("Delete the selected crop (Delete)")
         self._delete_crop.setEnabled(False)
         self._delete_crop.clicked.connect(self._delete_selected_crop)
+        self._detect_boxes = QPushButton("Detect boxes")
+        self._detect_boxes.setToolTip(
+            "Find objects in the photo with LibreYOLO and add their bounding boxes as crops"
+        )
+        self._detect_boxes.clicked.connect(self._start_box_detection)
         self._crop_hint = QLabel()
         self._crop_hint.setStyleSheet("color: palette(placeholder-text)")
 
@@ -704,6 +865,7 @@ class PreviewWindow(QWidget):
         header.addWidget(QLabel("<b>Crops</b>"))
         header.addWidget(self._add_crop)
         header.addWidget(self._delete_crop)
+        header.addWidget(self._detect_boxes)
         header.addWidget(self._crop_hint, 1)
         bar = QWidget()
         layout = QVBoxLayout(bar)
@@ -749,6 +911,10 @@ class PreviewWindow(QWidget):
         self._unsupported.setVisible(not (is_audio or media.kind.is_image))
         self._crop_bar.setVisible(is_audio or media.kind.is_image)
         self._add_crop.setChecked(False)
+        self._detect_boxes.setVisible(media.kind.is_image)
+        self._boxes_running = None
+        self._boxes_message = ""
+        self._update_detect_boxes()
         self._crops = [
             c for c in crops or [] if isinstance(c, AudioCrop if is_audio else ImageCrop)
         ]
@@ -901,15 +1067,71 @@ class PreviewWindow(QWidget):
             self._add(crop)
 
     def _add(self, crop: Crop) -> None:
+        self._boxes_message = ""
         self._crops.append(crop)
         self._refresh_crops(select=len(self._crops) - 1)
         self._emit_crops()
+
+    def _on_crop_edited(self, index: int, crop: ImageCrop) -> None:
+        """A crop was resized or moved on the image; its species are analysed anew."""
+        if not 0 <= index < len(self._crops):
+            return
+        self._boxes_message = ""
+        self._crops[index] = crop
+        self._refresh_crops(select=index)
+        self._emit_crops()
+
+    def _start_box_detection(self) -> None:
+        if (
+            self._media is None
+            or not self._media.kind.is_image
+            or self._boxes_running is not None
+        ):
+            return
+        self._boxes_running = self._generation
+        self._boxes_message = ""
+        self._update_detect_boxes()
+        self._update_crop_hint()
+        task = _BoxesTask(self._box_detector, self._media, self._generation)
+        task.signals.done.connect(self._on_boxes)
+        task.signals.done.connect(lambda *_: self._box_tasks.discard(task))
+        self._box_tasks.add(task)  # keep the Python object (and its signals) alive
+        QThreadPool.globalInstance().start(task)
+
+    def _on_boxes(self, generation: int, result: object) -> None:
+        if generation != self._generation:
+            return  # another file is shown now
+        self._boxes_running = None
+        self._update_detect_boxes()
+        if isinstance(result, str):
+            self._boxes_message = result
+            self._update_crop_hint()
+            return
+        boxes: list[DetectedBox] = result  # type: ignore[assignment]
+        existing = set(self._crops)
+        new = [b for b in boxes if b.crop not in existing]
+        if not new:
+            self._boxes_message = "No objects detected" if not boxes else "No new boxes"
+            self._update_crop_hint()
+            return
+        first = len(self._crops)
+        self._crops += [b.crop for b in new]
+        found = ", ".join(f"{b.label} {b.score:.0%}" for b in new)
+        self._boxes_message = f"Added {len(new)} box{'es' if len(new) != 1 else ''}: {found}"
+        self._refresh_crops(select=first)
+        self._emit_crops()
+
+    def _update_detect_boxes(self) -> None:
+        running = self._boxes_running is not None
+        self._detect_boxes.setEnabled(not running)
+        self._detect_boxes.setText("Detecting…" if running else "Detect boxes")
 
     def _delete_selected_crop(self) -> None:
         row = self._crop_list.currentRow()
         if not 0 <= row < len(self._crops):
             return
         del self._crops[row]
+        self._boxes_message = ""
         self._refresh_crops(select=min(row, len(self._crops) - 1) if self._crops else None)
         self._emit_crops()
 
@@ -1021,6 +1243,10 @@ class PreviewWindow(QWidget):
             is_audio = self._media is not None and self._media.kind is MediaKind.AUDIO
             target = "spectrogram" if is_audio else "image"
             text = f"Drag over the {target} to add a crop · Esc to finish"
+        elif self._boxes_running is not None:
+            text = "Detecting objects… (the model loads on first use)"
+        elif self._boxes_message:
+            text = self._boxes_message
         elif not self._crops:
             text = "No crops yet"
         else:
