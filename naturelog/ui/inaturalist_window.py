@@ -8,6 +8,10 @@ their EXIF; NatureLog replaces that location with the session one (moved on the
 map or interpolated on the GPS tracks) when there is one. For recordings it
 fills the date, the track position and the most probable detected species into
 their observation cards (empty fields only).
+Crops of the selected files are added too (unless switched off), each as a file
+of its own (JPEG or WAV rendered in memory) and so as an observation card of its
+own, with the card values of its original; a recording crop gets its start time
+and its own detected species.
 Reviewing and submitting observations stays on iNaturalist. Files are only
 read, never changed.
 
@@ -29,6 +33,7 @@ from PySide6.QtGui import QCloseEvent, QDesktopServices
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile, QWebEngineScript
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (
+    QCheckBox,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -38,6 +43,7 @@ from PySide6.QtWidgets import (
 )
 
 from naturelog.inaturalist import (
+    MAX_FILE_SIZE,
     SITE_URL,
     UPLOAD_PATH,
     UPLOAD_URL,
@@ -48,6 +54,8 @@ from naturelog.inaturalist import (
     upload_selection,
 )
 from naturelog.media import MediaFile
+from naturelog.media.crop_export import CropExportError, render_crop
+from naturelog.media.crops import Crop
 
 _PROFILE_NAME = "naturelog-inaturalist"
 #: Page script that shows computer-vision scores next to species suggestions.
@@ -201,11 +209,13 @@ class _ReadSignals(QObject):
 
 
 class _ReadTask(QRunnable):
-    """Read and base64-encode files off the UI thread."""
+    """Read (or render crops) and base64-encode files off the UI thread."""
 
-    def __init__(self, files: list[UploadFile]) -> None:
+    def __init__(self, files: list[UploadFile], media: dict[Path, MediaFile]) -> None:
         super().__init__()
         self.files = files
+        #: Originals of the crops in ``files``, by path.
+        self.media = media
         self.cancelled = threading.Event()
         self.signals = _ReadSignals()
 
@@ -214,11 +224,20 @@ class _ReadTask(QRunnable):
             if self.cancelled.is_set():
                 break
             try:
-                data = base64.b64encode(upload.path.read_bytes()).decode("ascii")
+                if upload.crop is None:
+                    raw = upload.path.read_bytes()
+                else:
+                    raw = render_crop(self.media[upload.path], upload.crop)
             except OSError as exc:
                 self.signals.failed.emit(upload, exc.strerror or str(exc))
-            else:
-                self.signals.file.emit(upload, data)
+                continue
+            except CropExportError as exc:
+                self.signals.failed.emit(upload, str(exc))
+                continue
+            if len(raw) > MAX_FILE_SIZE:
+                self.signals.failed.emit(upload, "larger than 20 MB")
+                continue
+            self.signals.file.emit(upload, base64.b64encode(raw).decode("ascii"))
         self.signals.finished.emit()
 
 
@@ -271,17 +290,20 @@ class InaturalistWindow(QWidget):
     def __init__(
         self,
         parent: QWidget | None = None,
-        hint_source: Callable[[MediaFile], ObservationHint | None] | None = None,
+        hint_source: Callable[[MediaFile, Crop | None], ObservationHint | None] | None = None,
+        crop_source: Callable[[MediaFile], list[Crop]] | None = None,
     ) -> None:
-        """``hint_source`` gives the card values to fill for a file (recordings, photos)."""
+        """``hint_source`` gives the card values to fill for a file (recordings, photos)
+        or one of its crops; ``crop_source`` gives the crops of a file."""
         super().__init__(parent, Qt.WindowType.Window)
         self.setWindowTitle("Upload to iNaturalist")
         self.resize(1200, 860)
 
         self._media: list[MediaFile] = []
         self._hint_source = hint_source
-        #: Card values of the files being transferred, by path.
-        self._hints: dict[Path, ObservationHint] = {}
+        self._crop_source = crop_source
+        #: Card values of the files (and crops) being transferred.
+        self._hints: dict[UploadFile, ObservationHint] = {}
         #: Card values of transferred files, keyed by ``name|size|lastModified``.
         self._fill: list[dict] = []
         self._fill_tries = 0
@@ -326,6 +348,13 @@ class InaturalistWindow(QWidget):
         self._url_label = QLabel()
         self._url_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self._status_label = QLabel()
+        self._include_crops = QCheckBox("Include crops")
+        self._include_crops.setChecked(True)
+        self._include_crops.setToolTip(
+            "Also upload the crops of the selected files, each as an observation of its own"
+        )
+        self._include_crops.toggled.connect(self._update_button)
+        self._include_crops.setVisible(crop_source is not None)
         self._send_button = QPushButton()
         self._send_button.setDefault(True)
         self._send_button.clicked.connect(self.send_files)
@@ -337,6 +366,7 @@ class InaturalistWindow(QWidget):
         bar.addWidget(home)
         bar.addWidget(self._url_label, 1)
         bar.addWidget(self._status_label)
+        bar.addWidget(self._include_crops)
         bar.addWidget(self._send_button)
 
         layout = QVBoxLayout(self)
@@ -354,11 +384,15 @@ class InaturalistWindow(QWidget):
         self._media = list(media)
         self._update_button()
 
+    def refresh_crops(self) -> None:
+        """Crops of the selected files changed (updates the button text)."""
+        self._update_button()
+
     def send_files(self) -> None:
         """Open the uploader and add the selected files to it."""
         if self._busy():
             return
-        selection = upload_selection(self._media)
+        selection = upload_selection(self._media, self._crops())
         if not selection.files:
             self._status("No selected file can be uploaded" + _skipped_note(selection.skipped))
             return
@@ -368,9 +402,9 @@ class InaturalistWindow(QWidget):
             by_path = {m.path: m for m in self._media}
             for upload in selection.files:
                 media = by_path.get(upload.path)
-                hint = self._hint_source(media) if media is not None else None
+                hint = self._hint_source(media, upload.crop) if media is not None else None
                 if hint is not None:
-                    self._hints[upload.path] = hint
+                    self._hints[upload] = hint
         if self._on_upload_page() and not self._view.page().isLoading():
             self._start_transfer()
         else:
@@ -394,9 +428,11 @@ class InaturalistWindow(QWidget):
         self._fill_timer.stop()
         self._failed = list(selection.skipped)
         self._page.runJavaScript(_JS_RESET, _WORLD)
-        task = _ReadTask(selection.files)
+        task = _ReadTask(selection.files, {m.path: m for m in self._media})
         task.signals.file.connect(self._on_file_read)
-        task.signals.failed.connect(lambda upload, error: self._failed.append((upload.path, error)))
+        task.signals.failed.connect(
+            lambda upload, error: self._failed.append((Path(upload.upload_name), error))
+        )
         task.signals.finished.connect(lambda: self._on_read_finished(task))
         self._task = task
         self._status(f"Transferring {len(selection.files)} file(s)…")
@@ -410,13 +446,13 @@ class InaturalistWindow(QWidget):
             mtime = int(upload.path.stat().st_mtime * 1000)
         except OSError:
             mtime = 0
-        hint = self._hints.get(upload.path)
+        hint = self._hints.get(upload)
         if hint is not None:
             size = len(data) // 4 * 3 - data[-2:].count("=")  # decoded base64 length
-            self._fill.append({**hint.to_json(), "key": f"{upload.path.name}|{size}|{mtime}"})
+            self._fill.append({**hint.to_json(), "key": f"{upload.upload_name}|{size}|{mtime}"})
         script = _JS_ADD % {
             "data": json.dumps(data),
-            "name": json.dumps(upload.path.name),
+            "name": json.dumps(upload.upload_name),
             "type": json.dumps(upload.mime_type),
             "mtime": mtime,
         }
@@ -538,13 +574,21 @@ class InaturalistWindow(QWidget):
         self._status_label.setText(text)
         self.message.emit(text)
 
-    def _update_button(self) -> None:
+    def _crops(self) -> dict[Path, list[Crop]]:
+        """Crops to upload with the selected files (none if switched off)."""
+        if self._crop_source is None or not self._include_crops.isChecked():
+            return {}
+        return {m.path: crops for m in self._media if (crops := self._crop_source(m))}
+
+    def _update_button(self, *_args) -> None:
         count = len(self._media)
-        self._send_button.setText(f"Add {count} selected file(s) to upload")
+        crops = sum(len(c) for c in self._crops().values())
+        extra = f" + {crops} crop{'s' if crops != 1 else ''}" if crops else ""
+        self._send_button.setText(f"Add {count} selected file(s){extra} to upload")
         self._send_button.setEnabled(count > 0 and not self._busy())
         self._send_button.setToolTip(
             "Open the iNaturalist uploader and add the files selected in NatureLog "
-            "(photos and sounds up to 20 MB)"
+            "(photos and sounds up to 20 MB); each crop becomes an observation of its own"
         )
 
 

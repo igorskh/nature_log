@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
 from naturelog.gps import GpsLogError, Track, load_track, position_on_tracks, tracks_span
 from naturelog.inaturalist import ObservationHint, observation_hint
 from naturelog.media import MediaFile
+from naturelog.media.crops import Crop
 from naturelog.species import DetectionConfig
 from naturelog.session import (
     Session,
@@ -223,6 +224,7 @@ class MainWindow(QMainWindow):
         self._map.moveRequested.connect(self._media.move_selected_to)
         self._media.positionsChanged.connect(self._refresh_map_markers)
         self._media.positionsChanged.connect(self._schedule_save)
+        self._media.cropsChanged.connect(self._schedule_save)
 
         self._track_panel = TrackSidebar()
         self._track_panel.addRequested.connect(self._choose_file)
@@ -236,6 +238,9 @@ class MainWindow(QMainWindow):
         self._species.detectRequested.connect(self._detect_species)
         self._species.configChanged.connect(self._schedule_save)
         self._species.detected.connect(self._media.set_detections)
+        self._species.cropDetected.connect(
+            lambda path, crop, preds: self._media.set_crop_detections({path: {crop: preds}})
+        )
         self._species.speciesActivated.connect(self._media.select_paths)
         self._media.detectRequested.connect(self._species.detect)
         self._media.detectionsChanged.connect(self._schedule_save)
@@ -244,7 +249,7 @@ class MainWindow(QMainWindow):
         self._species_timer.setSingleShot(True)
         self._species_timer.setInterval(300)
         self._species_timer.timeout.connect(
-            lambda: self._species.set_detections(self._media.detections())
+            lambda: self._species.set_detections(self._media.species_detections())
         )
         self._media.detectionsChanged.connect(self._species_timer.start)
 
@@ -428,13 +433,19 @@ class MainWindow(QMainWindow):
     # --- species --------------------------------------------------------
 
     def _detect_species(self) -> None:
-        """Detect species in the selected photos/recordings, or in all not yet analysed."""
+        """Detect species in the selected photos/recordings and their crops, or in all
+        files with the file or a crop not yet analysed."""
         selected = self._media.selected_files()
         if selected:
             files = selected
         else:
-            files = [m for m in self._media.media_files() if self._media.detections_for(m) is None]
-        self._species.detect(files)
+            files = [
+                m
+                for m in self._media.media_files()
+                if self._media.detections_for(m) is None or self._media.unanalysed_crops(m)
+            ]
+        crops = {m.path: c for m in files if (c := self._media.crops_for(m))}
+        self._species.detect(files, crops)
 
     # --- media on track -------------------------------------------------
 
@@ -505,7 +516,10 @@ class MainWindow(QMainWindow):
     def _show_inaturalist(self, files: list[MediaFile]) -> None:
         """Open (or raise) the iNaturalist upload window; it follows the media selection."""
         if self._inaturalist is None:
-            self._inaturalist = InaturalistWindow(self, self._observation_hint)
+            self._inaturalist = InaturalistWindow(
+                self, self._observation_hint, self._media.crops_for
+            )
+            self._media.cropsChanged.connect(self._inaturalist.refresh_crops)
             self._inaturalist.message.connect(self.statusBar().showMessage)
             self._media.selectionChanged.connect(self._inaturalist.set_files)
         self._inaturalist.set_files(files)
@@ -513,14 +527,22 @@ class MainWindow(QMainWindow):
         self._inaturalist.raise_()
         self._inaturalist.activateWindow()
 
-    def _observation_hint(self, media: MediaFile) -> ObservationHint | None:
-        """iNaturalist card values: session location, plus date and top species for recordings."""
+    def _observation_hint(
+        self, media: MediaFile, crop: Crop | None = None
+    ) -> ObservationHint | None:
+        """iNaturalist card values of a file or one of its crops: session location,
+        plus date and top species for recordings."""
+        if crop is None:
+            predictions = self._media.detections_for(media)
+        else:
+            predictions = self._media.crop_detections_for(media).get(crop)
         return observation_hint(
             media,
             self._tz,
             self._tracks,
-            self._media.detections_for(media),
+            predictions,
             self._media.moved_position(media),
+            crop,
         )
 
     def _show_preview(self, media: MediaFile) -> None:
@@ -528,10 +550,12 @@ class MainWindow(QMainWindow):
         if self._preview is None:
             self._preview = PreviewWindow(self)
             self._preview.navigateRequested.connect(self._navigate_preview)
+            self._preview.cropsChanged.connect(
+                lambda media, crops: self._media.set_crops({media.path: crops})
+            )
             self._media.filesAdded.connect(self._update_preview_position)
             self._media.filesRemoved.connect(self._update_preview_position)
-        self._preview.show_media(media, self._tz, self._media.detections_for(media))
-        self._update_preview_position()
+        self._preview_media(media)
         self._preview.show()
         self._preview.raise_()
         self._preview.activateWindow()
@@ -544,7 +568,17 @@ class MainWindow(QMainWindow):
         if target is None:
             return
         self._media.select_paths([target.path])
-        self._preview.show_media(target, self._tz, self._media.detections_for(target))
+        self._preview_media(target)
+
+    def _preview_media(self, media: MediaFile) -> None:
+        assert self._preview is not None
+        self._preview.show_media(
+            media,
+            self._tz,
+            self._media.detections_for(media),
+            self._media.crops_for(media),
+            self._media.crop_detections_for(media),
+        )
         self._update_preview_position()
 
     def _update_preview_position(self, *_args) -> None:
@@ -555,7 +589,10 @@ class MainWindow(QMainWindow):
     def _refresh_preview_species(self) -> None:
         preview = self._preview
         if preview is not None and preview.isVisible() and preview.media() is not None:
-            preview.set_predictions(self._media.detections_for(preview.media()))
+            media = preview.media()
+            preview.set_predictions(
+                self._media.detections_for(media), self._media.crop_detections_for(media)
+            )
 
     def _show_file_datetime(self) -> None:
         """Open (or raise) the window that maps file dates from source to target files."""
@@ -590,6 +627,8 @@ class MainWindow(QMainWindow):
                 self._media.position_of(m),
                 self._media.detections_for(m),
                 self._media.moved_position(m),
+                self._media.crops_for(m),
+                self._media.crop_detections_for(m),
             )
             for m in self._media.media_files()
         ]
@@ -635,6 +674,14 @@ class MainWindow(QMainWindow):
             entry.media.path: entry.moved_to
             for entry in session.media
             if entry.moved_to is not None
+        })  # fmt: skip
+        self._media.set_crops({
+            entry.media.path: entry.crops for entry in session.media if entry.crops
+        })  # fmt: skip
+        self._media.set_crop_detections({
+            entry.media.path: entry.crop_detections
+            for entry in session.media
+            if entry.crop_detections
         })  # fmt: skip
 
         notes = []

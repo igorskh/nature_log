@@ -3,8 +3,9 @@
 Uses chirppipe's ``ONNXBioacousticsPredictor`` building blocks (audio loading,
 chunking, ONNX inference) but not its ``predict``, which writes a CSV next
 to the recording: originals are only read, nothing is written beside them.
-Each recording gets the most probable species over all chunks, with the time
-span of the chunk that scored best.
+Each recording, and each cropped time range of it, gets the most probable
+species over all its chunks, with the time span (seconds from the start of the
+recording) of the chunk that scored best.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from naturelog.media import MediaFile
+from naturelog.media.crops import AudioCrop
 from naturelog.species.bioclip import DetectorUnavailable, detector_available
 from naturelog.species.models import LINEAGE_RANKS, AudioModel, SpeciesPrediction
 
@@ -132,13 +134,29 @@ class AudioDetector:
             self._predictor = predictor
         return self._predictor
 
-    def _classify(self, predictor: Any, path: Path) -> list[SpeciesPrediction] | None:
-        from chirps.ml.utils import chunk_audio
-
+    def _classify(
+        self, predictor: Any, path: Path, crops: Sequence[AudioCrop | None]
+    ) -> list[list[SpeciesPrediction] | None]:
+        """Predictions for each of ``crops`` of the recording (``None`` = whole file)."""
         loaded = predictor.load_audio(str(path))  # None if it cannot be decoded
         if not loaded:
-            return None
+            return [None] * len(crops)
         samples, rate = loaded
+        results: list[list[SpeciesPrediction] | None] = []
+        for crop in crops:
+            if crop is None:
+                results.append(self._classify_samples(predictor, samples, rate, 0.0))
+            else:
+                part = samples[int(crop.start * rate) : int(crop.end * rate)]
+                results.append(self._classify_samples(predictor, part, rate, crop.start))
+        return results
+
+    def _classify_samples(
+        self, predictor: Any, samples: Any, rate: int, offset: float
+    ) -> list[SpeciesPrediction]:
+        """Top species in ``samples``; spans are shifted by ``offset`` seconds."""
+        from chirps.ml.utils import chunk_audio
+
         chunks, spans = chunk_audio(
             samples, predictor.chunk_length, overlap=predictor.overlap, sr=rate
         )
@@ -150,23 +168,32 @@ class AudioDetector:
         best_chunk = probs.argmax(axis=0)  # per species: chunk with the highest score
         best_score = probs.max(axis=0)
         top = best_score.argsort()[::-1][:TOP_K]
-        return [
-            _prediction(predictor.labels[i], float(best_score[i]), spans[best_chunk[i]])
-            for i in top
-        ]
+        result = []
+        for i in top:
+            start, end = spans[best_chunk[i]]
+            result.append(
+                _prediction(predictor.labels[i], float(best_score[i]), (start + offset, end + offset))
+            )
+        return result
 
     def detect(
         self,
-        files: Sequence[MediaFile],
+        targets: Sequence[tuple[MediaFile, AudioCrop | None]],
         cancelled: threading.Event | None = None,
         on_loaded: Callable[[], None] | None = None,
-    ) -> Iterator[tuple[MediaFile, list[SpeciesPrediction] | None]]:
-        """Yield ``(media, top-k predictions)`` per recording; ``None`` if unreadable."""
+    ) -> Iterator[tuple[MediaFile, AudioCrop | None, list[SpeciesPrediction] | None]]:
+        """Yield ``(media, crop, top-k predictions)`` per whole recording (crop ``None``)
+        or crop of a recording; predictions are ``None`` if it cannot be decoded.
+        Each recording is decoded once for all its targets."""
+        by_file: dict[Path, tuple[MediaFile, list[AudioCrop | None]]] = {}
+        for media, crop in targets:
+            by_file.setdefault(media.path, (media, []))[1].append(crop)
         with self._lock:
             predictor = self._model()
             if on_loaded is not None:
                 on_loaded()
-            for media in files:
+            for media, crops in by_file.values():
                 if cancelled is not None and cancelled.is_set():
                     return
-                yield media, self._classify(predictor, media.path)
+                for crop, predictions in zip(crops, self._classify(predictor, media.path, crops)):
+                    yield media, crop, predictions

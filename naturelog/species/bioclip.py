@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import math
 import threading
 from collections.abc import Callable, Iterator, Sequence
 from typing import Any
@@ -17,11 +18,14 @@ from typing import Any
 from PIL import Image
 
 from naturelog.media import MediaFile, make_thumbnail
+from naturelog.media.crops import ImageCrop
 from naturelog.species.models import LINEAGE_RANKS, SpeciesPrediction
 
 #: Preview size fed to the model (BioCLIP itself works at 224 px).
 _INPUT_SIZE = 512
 _BATCH_SIZE = 8
+#: Largest preview decoded to cut small crops from, px.
+_MAX_CROP_SOURCE = 4096
 
 
 class DetectorUnavailable(Exception):
@@ -41,12 +45,26 @@ def _prediction(row: dict[str, Any]) -> SpeciesPrediction:
     )
 
 
-def _load_image(media: MediaFile) -> Image.Image | None:
-    data = make_thumbnail(media, _INPUT_SIZE)
+def _load_image(media: MediaFile, crop: ImageCrop | None = None) -> Image.Image | None:
+    """Oriented RGB preview of the photo, or of ``crop`` of it (decoded large enough
+    that the crop still has about ``_INPUT_SIZE`` px on its longer side)."""
+    size = _INPUT_SIZE
+    if crop is not None:
+        size = min(_MAX_CROP_SOURCE, math.ceil(_INPUT_SIZE / max(crop.width, crop.height, 1e-3)))
+    data = make_thumbnail(media, size)
     if data is None:
         return None
-    image = Image.open(io.BytesIO(data))
-    return image.convert("RGB")
+    image = Image.open(io.BytesIO(data)).convert("RGB")
+    if crop is not None:
+        w, h = image.size
+        box = (
+            round(crop.left * w),
+            round(crop.top * h),
+            max(round(crop.left * w) + 1, round((crop.left + crop.width) * w)),
+            max(round(crop.top * h) + 1, round((crop.top + crop.height) * h)),
+        )
+        image = image.crop(box)
+    return image
 
 
 class BioClipDetector:
@@ -74,11 +92,12 @@ class BioClipDetector:
 
     def detect(
         self,
-        files: Sequence[MediaFile],
+        targets: Sequence[tuple[MediaFile, ImageCrop | None]],
         cancelled: threading.Event | None = None,
         on_loaded: Callable[[], None] | None = None,
-    ) -> Iterator[tuple[MediaFile, list[SpeciesPrediction] | None]]:
-        """Yield ``(media, top-k predictions)`` per photo; ``None`` if it cannot be read.
+    ) -> Iterator[tuple[MediaFile, ImageCrop | None, list[SpeciesPrediction] | None]]:
+        """Yield ``(media, crop, top-k predictions)`` per whole photo (crop ``None``)
+        or crop of a photo; predictions are ``None`` if it cannot be read.
 
         Raises :class:`DetectorUnavailable` before the first result if the
         model cannot be loaded.
@@ -87,15 +106,15 @@ class BioClipDetector:
             inference = self._model()
             if on_loaded is not None:
                 on_loaded()
-            for start in range(0, len(files), _BATCH_SIZE):
+            for start in range(0, len(targets), _BATCH_SIZE):
                 if cancelled is not None and cancelled.is_set():
                     return
-                batch = files[start : start + _BATCH_SIZE]
-                images = [_load_image(m) for m in batch]
-                readable = [(m, img) for m, img in zip(batch, images) if img is not None]
-                for media, image in zip(batch, images):
+                batch = targets[start : start + _BATCH_SIZE]
+                images = [_load_image(m, c) for m, c in batch]
+                readable = [(t, img) for t, img in zip(batch, images) if img is not None]
+                for (media, crop), image in zip(batch, images):
                     if image is None:
-                        yield media, None
+                        yield media, crop, None
                 if not readable:
                     continue
                 # Top-5 species per image; in-memory images are keyed by list index.
@@ -103,5 +122,5 @@ class BioClipDetector:
                 grouped: dict[int, list[SpeciesPrediction]] = {}
                 for row in rows:
                     grouped.setdefault(int(row["file_name"]), []).append(_prediction(row))
-                for index, (media, _) in enumerate(readable):
-                    yield media, grouped.get(index, [])
+                for index, ((media, crop), _) in enumerate(readable):
+                    yield media, crop, grouped.get(index, [])

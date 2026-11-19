@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from pathlib import Path
 
 from naturelog.media import MediaFile, MediaKind
+from naturelog.media.crops import AudioCrop, Crop, ImageCrop
 from naturelog.species.audio import AudioDetector
 from naturelog.species.bioclip import BioClipDetector
 from naturelog.species.models import AudioModel, DetectionConfig, ImageModel, SpeciesPrediction
@@ -38,17 +40,28 @@ class SpeciesDetector:
         config: DetectionConfig | None = None,
         cancelled: threading.Event | None = None,
         on_loaded: Callable[[], None] | None = None,
-    ) -> Iterator[tuple[MediaFile, list[SpeciesPrediction] | None]]:
-        """Yield ``(media, predictions)``: photos first, then recordings.
+        crops: Mapping[Path, Sequence[Crop]] | None = None,
+    ) -> Iterator[tuple[MediaFile, Crop | None, list[SpeciesPrediction] | None]]:
+        """Yield ``(media, crop, predictions)``: photos first, then recordings.
 
+        Each file is classified as a whole (crop ``None``) and, if ``crops`` lists
+        crops of it, each crop separately.
         ``config`` picks the models (defaults: BioCLIP 2, BirdNET v3).
         ``on_loaded`` is called whenever a model is ready and its files start.
         Unsupported files are skipped. Raises ``DetectorUnavailable`` if a
         needed model cannot be loaded.
         """
         config = config or DetectionConfig()
-        photos = [m for m in files if m.kind.is_image]
-        recordings = [m for m in files if m.kind is MediaKind.AUDIO]
+        crops = crops or {}
+        photos: list[tuple[MediaFile, ImageCrop | None]] = []
+        recordings: list[tuple[MediaFile, AudioCrop | None]] = []
+        for m in files:
+            if m.kind.is_image:
+                photos.append((m, None))
+                photos += [(m, c) for c in crops.get(m.path, ()) if isinstance(c, ImageCrop)]
+            elif m.kind is MediaKind.AUDIO:
+                recordings.append((m, None))
+                recordings += [(m, c) for c in crops.get(m.path, ()) if isinstance(c, AudioCrop)]
         if photos:
             yield from self._photo_detector(config.image_model).detect(photos, cancelled, on_loaded)
         if recordings and not (cancelled is not None and cancelled.is_set()):

@@ -7,13 +7,15 @@ iNaturalist web uploader, where the user reviews and submits them.
 from __future__ import annotations
 
 import mimetypes
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, tzinfo
+from datetime import datetime, timedelta, tzinfo
 from pathlib import Path
 from typing import Any
 
 from naturelog.gps import Track, position_on_tracks
+from naturelog.media.crop_export import crop_file_name, crop_mime_type
+from naturelog.media.crops import AudioCrop, Crop
 from naturelog.media.models import MediaFile, MediaKind
 from naturelog.species import SpeciesPrediction, top_detection
 
@@ -39,8 +41,18 @@ _SOUND_EXTENSIONS = frozenset({".wav", ".mp3", ".m4a", ".aac", ".ogg", ".oga", "
 
 @dataclass(frozen=True, slots=True)
 class UploadFile:
+    """A file to upload: an original, or a crop of it rendered when it is read."""
+
     path: Path
     mime_type: str
+    #: Crop of the original at ``path`` to upload instead of the whole file.
+    crop: Crop | None = None
+    #: File name the uploader sees (the original's name for whole files).
+    name: str = ""
+
+    @property
+    def upload_name(self) -> str:
+        return self.name or self.path.name
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,29 +67,48 @@ def is_allowed_host(host: str) -> bool:
     return any(host == allowed or host.endswith("." + allowed) for allowed in ALLOWED_HOSTS)
 
 
-def upload_selection(media: Iterable[MediaFile]) -> UploadSelection:
-    """Split ``media`` into files the iNaturalist uploader accepts and skipped ones."""
+def upload_selection(
+    media: Iterable[MediaFile], crops: Mapping[Path, Sequence[Crop]] | None = None
+) -> UploadSelection:
+    """Split ``media`` into files the iNaturalist uploader accepts and skipped ones.
+
+    Each of the ``crops`` of a photo or recording follows its original as a
+    file of its own (JPEG or WAV, rendered when read), even if the original
+    itself cannot be uploaded (RAW photos, large recordings).
+    """
     files: list[UploadFile] = []
     skipped: list[tuple[Path, str]] = []
+    crops = crops or {}
     for item in media:
-        path = item.path
-        ext = path.suffix.lower()
-        if ext not in _PHOTO_EXTENSIONS and ext not in _SOUND_EXTENSIONS:
-            skipped.append((path, "unsupported format"))
-            continue
-        try:
-            size = path.stat().st_size
-        except OSError as exc:
-            skipped.append((path, f"not readable ({exc.strerror or exc})"))
-            continue
-        if size > MAX_FILE_SIZE:
-            skipped.append((path, "larger than 20 MB"))
-            continue
-        mime = mimetypes.guess_type(path.name)[0]
-        if mime is None:
-            mime = "image/heic" if ext in {".heic", ".heif"} else "application/octet-stream"
-        files.append(UploadFile(path, mime))
+        _add_original(item, files, skipped)
+        if item.kind.is_image or item.kind is MediaKind.AUDIO:
+            for number, crop in enumerate(crops.get(item.path, ()), 1):
+                name = crop_file_name(item, crop, number)
+                files.append(UploadFile(item.path, crop_mime_type(crop), crop, name))
     return UploadSelection(files, skipped)
+
+
+def _add_original(
+    item: MediaFile, files: list[UploadFile], skipped: list[tuple[Path, str]]
+) -> None:
+    """Append the original file to ``files``, or to ``skipped`` with the reason."""
+    path = item.path
+    ext = path.suffix.lower()
+    if ext not in _PHOTO_EXTENSIONS and ext not in _SOUND_EXTENSIONS:
+        skipped.append((path, "unsupported format"))
+        return
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        skipped.append((path, f"not readable ({exc.strerror or exc})"))
+        return
+    if size > MAX_FILE_SIZE:
+        skipped.append((path, "larger than 20 MB"))
+        return
+    mime = mimetypes.guess_type(path.name)[0]
+    if mime is None:
+        mime = "image/heic" if ext in {".heic", ".heif"} else "application/octet-stream"
+    files.append(UploadFile(path, mime))
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,8 +155,12 @@ def observation_hint(
     tracks: Sequence[Track],
     predictions: Sequence[SpeciesPrediction] | None,
     moved_to: tuple[float, float] | None = None,
+    crop: Crop | None = None,
 ) -> ObservationHint | None:
     """Suggested card values for a recording or photo; ``None`` for other files.
+
+    For a ``crop`` of a recording the time is that of the crop's start and
+    ``predictions`` should be the crop's own.
 
     The location is ``moved_to`` (set by the user on the map) if given, else
     the GPS tracks at the capture time (no position outside the track, never
@@ -144,6 +179,8 @@ def observation_hint(
             return None
         return ObservationHint(latitude=moved_to[0], longitude=moved_to[1], replace_location=True)
     species = top_detection(predictions)
+    if isinstance(crop, AudioCrop):
+        when += timedelta(seconds=crop.start)
     return ObservationHint(
         observed_at=when.astimezone(tz).replace(tzinfo=None),
         latitude=moved_to[0] if moved_to else None,
