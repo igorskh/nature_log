@@ -687,7 +687,7 @@ class PreviewWindow(QWidget):
         fm = self.fontMetrics()
         grid = QSize(
             max(_CROP_ICON.width(), fm.horizontalAdvance("Eurasian Blackbird · 00%")) + 16,
-            _CROP_ICON.height() + 2 * fm.height() + 10,
+            _CROP_ICON.height() + 2 * fm.height() + 20,
         )
         self._crop_list.setGridSize(grid)
         scrollbar = self.style().pixelMetric(QStyle.PixelMetric.PM_ScrollBarExtent)
@@ -928,6 +928,9 @@ class PreviewWindow(QWidget):
         for crop in self._crops:
             item = QListWidgetItem()
             item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            # A static icon view places items once, by their size when added; the
+            # label and thumbnail come later, so give each item its full cell now.
+            item.setSizeHint(self._crop_list.gridSize())
             self._crop_list.addItem(item)
         if select is not None:
             self._crop_list.setCurrentRow(select)
@@ -937,6 +940,15 @@ class PreviewWindow(QWidget):
         self._refresh_crop_icons()
         self._update_overlays()
         self._update_crop_hint()
+        if select is not None:
+            # clear() reset the scroll position: bring the selected crop into view
+            # once the view has laid out the new items (it delays that).
+            QTimer.singleShot(0, self._scroll_to_selected_crop)
+
+    def _scroll_to_selected_crop(self) -> None:
+        item = self._crop_list.currentItem()
+        if item is not None:
+            self._crop_list.scrollToItem(item)
 
     def _update_crop_labels(self) -> None:
         """Number, size or time range and top detected species of each crop in the strip."""
