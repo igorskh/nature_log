@@ -11,3 +11,6 @@ wheels/
 
 # Local model files (see README)
 models/
+
+# macOS Finder metadata
+.DS_Store
