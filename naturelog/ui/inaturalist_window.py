@@ -8,6 +8,10 @@ their EXIF; for recordings NatureLog fills the date, the track position and the
 most probable detected species into their observation cards (empty fields only).
 Reviewing and submitting observations stays on iNaturalist. Files are only
 read, never changed.
+
+The species suggestions iNaturalist's computer vision offers for a photo are
+shown with their scores (iNaturalist computes them but does not display them),
+see ``resources/inat_vision_scores.js``.
 """
 
 from __future__ import annotations
@@ -44,6 +48,8 @@ from naturelog.inaturalist import (
 from naturelog.media import MediaFile
 
 _PROFILE_NAME = "naturelog-inaturalist"
+#: Page script that shows computer-vision scores next to species suggestions.
+_VISION_SCORES_JS = Path(__file__).parent / "resources" / "inat_vision_scores.js"
 #: Our scripts run isolated from the page's own JavaScript; DOM and events are shared.
 _WORLD = QWebEngineScript.ScriptWorldId.ApplicationWorld
 #: Filling cards needs the page's React state, which only the page's own world sees.
@@ -211,6 +217,17 @@ def _profile(parent: QObject) -> QWebEngineProfile:
     return profile
 
 
+def _vision_scores_script() -> QWebEngineScript:
+    """Installed before the site's own scripts run, in the page's world (it wraps fetch)."""
+    script = QWebEngineScript()
+    script.setName("naturelog-vision-scores")
+    script.setSourceCode(_VISION_SCORES_JS.read_text(encoding="utf-8"))
+    script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
+    script.setWorldId(_PAGE_WORLD)
+    script.setRunsOnSubFrames(False)
+    return script
+
+
 class _Page(QWebEnginePage):
     """Keeps navigation on iNaturalist and its sign-in providers."""
 
@@ -269,6 +286,7 @@ class InaturalistWindow(QWidget):
         self._view = QWebEngineView(self)
         self._profile = _profile(self)
         self._page = _Page(self._profile, self._view)
+        self._page.scripts().insert(_vision_scores_script())
         self._view.setPage(self._page)
         self._view.urlChanged.connect(self._on_url_changed)
         self._view.loadStarted.connect(self._on_load_started)
